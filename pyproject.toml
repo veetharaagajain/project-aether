@@ -1,0 +1,25 @@
+[project]
+name = "aether"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "librosa>=0.11.0",
+    "matplotlib>=3.11.1",
+    "numpy>=2.4.6",
+    "praat-parselmouth>=0.4.7",
+    "pydantic>=2.13.4",
+    "scipy>=1.17.1",
+    "silero-vad>=6.2.1",
+    "sounddevice>=0.5.5",
+    "soundfile>=0.14.0",
+]
+
+[project.scripts]
+being = "being:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
