@@ -3,3 +3,5 @@ corpus/
 __pycache__/
 *.wav
 *.png
+baselines.json
+.claude/settings.local.json
