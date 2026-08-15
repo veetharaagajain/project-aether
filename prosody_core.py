@@ -84,6 +84,49 @@ def energy_envelope(snd):
     return times, db
 
 
+def distance_proxy(snd, times=None, db=None):
+    """Two candidate measures of how far the speaker was from the microphone.
+
+    Level cannot answer this on its own: a shout at arm's length and an
+    ordinary voice at the laptop produce the same dB. What is supposed to
+    separate them is the ratio of direct sound to room reflection, which does
+    not change with vocal effort because both the direct and the reflected
+    path scale together with it.
+
+    mod_ratio  energy in the 4 to 16 Hz modulation band of the envelope over
+               the 0.5 to 4 Hz band, in dB. Reverberation smears the envelope
+               in time, which eats the fast syllabic modulation and leaves the
+               slow phrase-level one. It is a ratio, so multiplying the whole
+               waveform by any constant cancels exactly.
+    dyn_range  the 90th minus the 10th percentile of the envelope over speech
+               frames, in dB. Reflections fill the valleys between syllables.
+
+    Both are measured; neither is trusted. See baseline.py calibrate for what
+    they do on recordings made at known distances.
+    """
+    if times is None or db is None:
+        times, db = energy_envelope(snd)
+    if not len(db):
+        return {'mod_ratio': float('nan'), 'dyn_range': float('nan'),
+                'level_db': float('nan')}
+    speech_db, noise_db = split_speech_noise_db(db)
+    thr, _, _ = silence_threshold_db(speech_db, noise_db)
+    lin = 10.0 ** (db / 20.0)
+    e = lin - lin.mean()
+    spec = np.abs(np.fft.rfft(e * np.hanning(len(e)))) ** 2
+    freq = np.fft.rfftfreq(len(e), ENVELOPE_HOP_S)
+    fast = spec[(freq >= 4.0) & (freq < 16.0)].sum()
+    slow = spec[(freq >= 0.5) & (freq < 4.0)].sum()
+    voiced = db[db >= thr]
+    return {
+        'mod_ratio': float(10.0 * np.log10(fast / slow)) if slow > 0 else float('nan'),
+        'dyn_range': (float(np.percentile(voiced, 90))
+                      - float(np.percentile(voiced, 10)))
+        if len(voiced) else float('nan'),
+        'level_db': float(speech_db),
+    }
+
+
 def split_speech_noise_db(db):
     """Median energy of the speech frames and of the quiet frames.
 
@@ -545,5 +588,6 @@ def measure(path):
         'threshold_from_noise_db': from_noise,
         'threshold_set_by': 'noise floor' if from_noise > from_speech else 'speech drop',
         'silences': silences,
+        'distance': distance_proxy(snd, env_t, env_db),
         'total': total,
     }

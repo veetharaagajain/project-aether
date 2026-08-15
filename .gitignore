@@ -5,3 +5,4 @@ __pycache__/
 *.png
 baselines.json
 .claude/settings.local.json
+out_*.txt
