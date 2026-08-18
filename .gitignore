@@ -27,3 +27,5 @@ build/
 
 # the memory store: one person's life. Never committed.
 store/
+# compiled relevance bridge
+bridge/relevance

@@ -423,12 +423,28 @@ def search_memory(db, caller, secret, query, limit=10, kinds=None,
     ks = tuple(kinds) if kinds else ('observation', 'belief')
     hits = mem.search(db, query, limit=limit, kinds=ks,
                       include_superseded=include_superseded)
+    # Rank, then judge. memory.search orders by resemblance, and resemblance is
+    # not an answer: the same question that returned the person's breakfast
+    # also returned two other people asking about breakfast, ranked above it.
+    # relevance.narrow is the first thing in this project that decides rather
+    # than measures, and it runs before anything reaches approval, so what the
+    # person is shown to approve is what would actually be handed over.
+    import relevance as rl
+    considered = len(hits)
+    try:
+        hits, note = rl.narrow(db, query, hits)
+    except rl.Unavailable as e:
+        log(db, caller, 'search_memory', args, 'denied', f"judge unavailable: {e}")
+        raise Denied(str(e))
+    args['narrowed'] = f"{note.get('kept', considered)} of {considered}"
     ok, why2 = release(db, caller, 'search_memory', args, hits,
                        [f"[{h['kind']}] {h['text']}" for h in hits])
     if not ok:
         log(db, caller, 'search_memory', args, 'denied', why2)
         raise Denied(why2)
-    log(db, caller, 'search_memory', args, 'allowed', f"{why}; {why2}", hits)
+    log(db, caller, 'search_memory', args, 'allowed',
+        f"{why}; {why2}; narrowed {note.get('kept', considered)}/{considered}"
+        + (f" in {note['seconds']}s" if note.get('seconds') else ""), hits)
     return hits
 
 
