@@ -49,7 +49,7 @@ CUE_COLUMN = {
 }
 
 
-def apply_pause(rows, ref, total):
+def apply_pause(rows, ref, total, only=None):
     """The emphatic pause: a short beat around a word, and nothing else.
 
     Three things are excluded before anything is measured. The gap before the
@@ -66,6 +66,11 @@ def apply_pause(rows, ref, total):
     cap = ref.get('pause_cap_s', float('nan'))
     mu, sd = ref.get('pause_mu', float('nan')), ref.get('pause_sd', float('nan'))
     for i, r in enumerate(rows):
+        # the gaps always come from the whole recording, because the silence
+        # around a word is real silence whoever else was or was not talking;
+        # only which words get scored here is restricted to one voice
+        if only is not None and i not in only:
+            continue
         b, a = bl.eligible_gaps(rows, i, total)
         b_cap = min(b, cap) if not np.isnan(cap) else b
         a_cap = min(a, cap) if not np.isnan(cap) else a
@@ -113,33 +118,76 @@ def apply_weight(rows):
             den += WEIGHTS[cue]
             present.append(cue)
         r['weight'] = num / den if den else float('nan')
-        r['cues_used'] = ''.join(c[0] for c in present)
+        r['cues_used'] = ','.join(present)
+
+
+def live_cues(rows):
+    """Which cues actually contributed anywhere in this file.
+
+    Not from cues_used initials: 'pitch' and 'pause' share a letter, and a
+    check written on the initials reported three of four cues on every file
+    including ones where all four were live.
+    """
+    return [k for k, col in CUE_COLUMN.items()
+            if any(not np.isnan(r.get(col, float('nan'))) for r in rows)]
 
 
 def score_file(path, speaker='owner'):
+    """Score every word against its own speaker's reference.
+
+    This used to take one reference for the whole file, which is right for a
+    recording of one person and wrong for any other. On a two-host podcast it
+    scored both hosts against the stored baseline of whoever owns the machine.
+    """
     rows, info = measure(path)
     store = bl.load()
-    stored = bool(store.get(speaker)) and bool(
-        store[speaker]['decl']['n_sentences'] or store[speaker]['pitch']['n'])
-    ref = bl.summary(store[speaker]) if stored else nz.per_file_reference(rows)
+    refs = nz.per_speaker_references(rows, store, speaker)
+    pause = (float('nan'),) * 3
 
-    nz.apply_baselines(rows, ref)
-    nz.apply_rolling(rows, ref, stored)
-    nz.apply_defaults(rows)
-    nz.apply_stored_decline(rows, ref)
-    apply_duration_position(rows, ref)
-    pause_cap, pause_mu, pause_sd = apply_pause(rows, ref, info['total'])
-    apply_weight(rows)
-    return rows, info, ref, stored, (pause_cap, pause_mu, pause_sd)
+    for sid, entry in refs.items():
+        idx = {i for i, r in enumerate(rows) if r.get('speaker', 1) == sid}
+        mine = [rows[i] for i in sorted(idx)]
+        ref = entry['ref']
+        if ref is None:
+            for r in mine:
+                r['weight'] = float('nan')
+                r['cues_used'] = ''
+                r['dur_pos_class'] = bl.position_class(r)
+                r['scored'] = False
+            continue
+        nz.apply_baselines(mine, ref)
+        nz.apply_rolling(mine, ref, entry['stored'])
+        nz.apply_defaults(mine)
+        nz.apply_stored_decline(mine, ref)
+        apply_duration_position(mine, ref)
+        pause = apply_pause(rows, ref, info['total'], only=idx)
+        apply_weight(mine)
+        for r in mine:
+            r['scored'] = True
+
+    main_id = max(refs, key=lambda s: refs[s]['n_words'])
+    ref = refs[main_id]['ref'] or nz.per_file_reference(rows)
+    return rows, info, ref, refs[main_id]['stored'], pause, refs
 
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "corpus/test.wav"
     speaker = sys.argv[2] if len(sys.argv) > 2 else "owner"
-    rows, info, ref, stored, (pause_cap, pause_mu, pause_sd) = \
+    rows, info, ref, stored, (pause_cap, pause_mu, pause_sd), refs = \
         score_file(path, speaker)
 
     print(f"speaker: {speaker}    file: {path}")
+    for sid, entry in sorted(refs.items()):
+        print(f"  speaker {sid}: {entry['n_words']} usable word(s), "
+              f"reference {entry['kind']} -- {entry['why']}")
+    live = live_cues(rows)
+    if len(live) < len(CUE_COLUMN):
+        print("WARNING: only these cues are live on this file: "
+              + ", ".join(live)
+              + ". The rest need a stored baseline (declination, positional "
+                "duration offsets, the emphatic pause cap) and a within-file "
+                "reference has none of them, so the weight is a weighted sum "
+                "of fewer things than it looks like.")
     if stored:
         print(f"baseline: STORED, {len(ref['files'])} file(s), "
               f"{ref['n_words']} non-suspect words")

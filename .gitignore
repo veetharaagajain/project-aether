@@ -6,3 +6,11 @@ __pycache__/
 baselines.json
 .claude/settings.local.json
 out_*.txt
+models/
+people.json
+live_records.jsonl
+bridge/probe
+bridge/transcribe
+bridge/stream
+bridge/lang
+bridge/*.dSYM

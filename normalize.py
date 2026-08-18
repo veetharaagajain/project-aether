@@ -41,6 +41,65 @@ def z(value, mean, sd):
     return (value - mean) / sd
 
 
+# A voice needs at least this many usable words in a recording before a
+# within-file reference means anything. It is the same figure the short-term
+# rolling window already refuses to work below.
+MIN_REF_WORDS = 20
+
+
+def per_speaker_references(rows, store, speaker_key='owner'):
+    """One reference per voice in the recording, and how each was arrived at.
+
+    Every baseline, z-score and comparison in this layer was written assuming
+    one voice per file. Mixing two people into one reference makes all of them
+    meaningless: the quieter speaker reads as permanently unemphatic and the
+    louder one as permanently emphatic, and neither statement is about
+    emphasis. So a word is scored against its own speaker or against nothing.
+
+    Which reference a voice gets depends on what can honestly be claimed:
+
+      stored      the recording holds one voice, so it is the person whose
+                  baseline is stored. This is the assumption the whole layer
+                  has always made, now stated rather than implied.
+      within-file the recording holds more than one voice. Diarization numbers
+                  them; it does not say which is the owner, and recognising
+                  them is a separate piece of work that does not exist yet. So
+                  no stored baseline may be attributed to any of them, and
+                  each is scored against its own words in this recording.
+      none        the voice has fewer than MIN_REF_WORDS usable words here.
+                  Nothing is computed for it: no z-scores, no weight, no
+                  marks. Its words render as plain text and the record says
+                  why. It does not quietly borrow anyone else's reference.
+    """
+    ids = sorted({r.get('speaker', 1) for r in rows})
+    stored_ok = bool(store.get(speaker_key)) and bool(
+        store[speaker_key]['decl']['n_sentences'] or store[speaker_key]['pitch']['n'])
+    single = len(ids) == 1
+    out = {}
+    for sid in ids:
+        mine = [r for r in rows if r.get('speaker', 1) == sid]
+        usable = [r for r in mine if not r['suspect']]
+        if single and stored_ok:
+            out[sid] = {'ref': __import__('baseline').summary(store[speaker_key]),
+                        'kind': 'stored', 'stored': True, 'n_words': len(usable),
+                        'why': f"one voice in the recording, scored against the "
+                               f"stored baseline for '{speaker_key}'"}
+        elif len(usable) >= MIN_REF_WORDS:
+            out[sid] = {'ref': per_file_reference(mine), 'kind': 'within-file',
+                        'stored': False, 'n_words': len(usable),
+                        'why': f"{len(ids)} voices in the recording and no way "
+                               f"to say which is the stored speaker, so this "
+                               f"voice is scored against its own {len(usable)} "
+                               f"words here"}
+        else:
+            out[sid] = {'ref': None, 'kind': 'none', 'stored': False,
+                        'n_words': len(usable),
+                        'why': f"only {len(usable)} usable word(s), fewer than "
+                               f"the {MIN_REF_WORDS} a reference needs; nothing "
+                               f"is scored for this voice"}
+    return out
+
+
 def per_file_reference(rows):
     """Fallback reference when the speaker has no stored baseline.
 
@@ -111,8 +170,12 @@ def apply_rolling(rows, ref, stored):
             'dur': np.array([r['dur'] for r in rows])}
     order = np.argsort(ends)
 
+    # the rolling window only ever looks at the same voice; a reference made
+    # of two people's recent speech describes neither
+    spk = np.array([r.get('speaker', 1) for r in rows])
+
     for i, r in enumerate(rows):
-        m = ok & (ends >= ends[i] - w) & (ends <= ends[i])
+        m = ok & (ends >= ends[i] - w) & (ends <= ends[i]) & (spk == spk[i])
         m[i] = False
         source = 'window'
         if int(m.sum()) < bl.SHORT_TERM_MIN_WORDS:
@@ -120,7 +183,8 @@ def apply_rolling(rows, ref, stored):
                 source = 'stored'
             else:
                 near = [j for j in order[np.argsort(np.abs(ends[order] - ends[i]))]
-                        if ok[j] and j != i][:bl.SHORT_TERM_MIN_WORDS]
+                        if ok[j] and j != i
+                        and spk[j] == spk[i]][:bl.SHORT_TERM_MIN_WORDS]
                 m = np.zeros(len(rows), dtype=bool)
                 m[near] = True
                 source = 'nearest'

@@ -15,7 +15,6 @@ Nothing here scores, weights or normalizes anything.
 
 import numpy as np
 import parselmouth
-from faster_whisper import WhisperModel
 
 PITCH_FLOOR_HZ = 60.0        # fallback range, used only when a file has too
 PITCH_CEILING_HZ = 300.0     # little voiced speech to derive one from
@@ -58,7 +57,18 @@ SILENCE_DROP_DB = 15.0       # silence is this far below median speech energy
 NOISE_MARGIN_DB = 6.0        # ...but never nearer than this to the noise floor
 MIN_SILENCE_S = 0.150        # shorter dips than this are not pauses
 
-WHISPER_MODEL = "small.en"
+# The recogniser is Apple's SpeechAnalyzer, reached through speech.py. There
+# is one of them and both paths use it; see speech.py for why not two.
+#
+# It replaced faster-whisper base.en on measured grounds: 2.0 to 4.4 times
+# faster with the gap widening on long audio, better on compounds, named
+# entities, punctuation and casing, half as many zero-duration words, real
+# streaming with absolute timestamps, and Kannada. The cost is its 60 ms
+# timestamp grid against Whisper's 20 ms, which discards about 58 percent more
+# words and moves pitch by roughly 5 Hz at the p90. Word edges move by a median
+# of 70 ms, which is why baselines.json has to be rebuilt whenever this
+# changes.
+TRANSCRIBE_LOCALE = "en_US"
 
 
 def energy_envelope(snd):
@@ -343,12 +353,21 @@ def assign_sentences(rows):
     recorded so their contributions stay separable.
     """
     candidates = gap_boundaries = rejected = 0
-    punct_only = gap_only = both = 0
+    punct_only = gap_only = both = speaker_only = 0
     decisions = []
     run_start = 0
     for i, r in enumerate(rows):
         r['boundary_cue'] = ''
         if i > 0:
+            # a change of voice always ends the utterance, whatever the gap
+            # and whatever the punctuation did, because an utterance belongs
+            # to one speaker by definition
+            if r.get('speaker') != rows[i - 1].get('speaker'):
+                speaker_only += 1
+                r['boundary_cue'] = 'speaker'
+                run_start = i
+                r['sentence'] = run_start
+                continue
             gap = r['gap_before']
             gap_fired, p, ref, scope = False, float('nan'), float('nan'), ''
             if gap >= SENTENCE_GAP_MIN_S:
@@ -389,6 +408,7 @@ def assign_sentences(rows):
         'punct_only': punct_only,
         'gap_only': gap_only,
         'both': both,
+        'speaker_only': speaker_only,
         'decisions': decisions,
     }
 
@@ -441,12 +461,26 @@ def build_rows(words, silences, pitch_t, pitch_hz, int_t, int_db, total):
     return rows
 
 
-def flag_suspect(rows):
-    """Mark rows that are not trustworthy measurements, with the reasons."""
-    p90_all = [r['int_p90'] for r in rows if not np.isnan(r['int_p90'])]
-    p90_median = float(np.median(p90_all)) if p90_all else float('nan')
+def flag_suspect(rows, p90_median=None):
+    """Mark rows that are not trustworthy measurements, with the reasons.
+
+    p90_median is normally this file's own median word loudness. The live path
+    passes the session's running median instead, because a two-second segment
+    has no meaningful median of its own: a segment in which every word is
+    quiet would call none of them quiet.
+    """
+    if p90_median is None:
+        p90_all = [r['int_p90'] for r in rows if not np.isnan(r['int_p90'])]
+        p90_median = float(np.median(p90_all)) if p90_all else float('nan')
     for r in rows:
         reasons = []
+        # a word the transcript gave no duration at all. Whisper's aligner
+        # emits these with start and end already identical, so they are not
+        # trimming casualties and there is nothing in the audio to measure.
+        # Named separately because "few_voiced" describes the symptom and
+        # this is the cause.
+        if r['orig_end'] <= r['orig_start'] or r['end'] <= r['start']:
+            reasons.append('zero_span')
         if r['n_voiced'] < MIN_VOICED_FRAMES:
             reasons.append('few_voiced')
         if not np.isnan(r['int_p90']) and r['int_p90'] < p90_median - QUIET_MARGIN_DB:
@@ -510,11 +544,19 @@ def silence_log(rows, total):
     return log
 
 
-def measure(path):
-    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-    segments, info = model.transcribe(path, word_timestamps=True, vad_filter=True)
-
-    words = [w for seg in segments for w in seg.words]
+def measure(path, speakers=True, locale=None):
+    import speech
+    # vad_filter has no equivalent here. faster-whisper used it to skip
+    # non-speech regions, mostly to stop the decoder hallucinating text into
+    # long silences. SpeechAnalyzer has no such switch, so what replaces it is
+    # the silence detection this file already does: every word is measured
+    # over a silence-trimmed span, a word landing entirely inside silence is
+    # flagged zero_span, and diarize.py builds its windows from the same
+    # silences. What is lost is the chance to drop a hallucinated word before
+    # it is ever measured; it now arrives, gets trimmed to nothing and gets
+    # flagged. On turns1, which is 76 percent silence, this produced no flood
+    # of spurious words: 517 against base.en's 508.
+    words, _ = speech.transcribe_file(path, locale or TRANSCRIBE_LOCALE)
 
     snd = parselmouth.Sound(path)
     total = snd.get_total_duration()
@@ -551,6 +593,18 @@ def measure(path):
     rows = build_rows(words, silences, pitch_t, pitch_hz, int_t, int_db, total)
     p90_median = flag_suspect(rows)
 
+    # who spoke each word, before sentences are assigned, because a change of
+    # speaker is itself an utterance boundary
+    if speakers:
+        from diarize import diarize
+        _, diar = diarize(path, rows, silences, total)
+    else:
+        for r in rows:
+            r['speaker'] = 1
+            r['speaker_source'] = 'diarization off'
+        diar = {'n_speakers': 1, 'speakers': {1: {'share': 1.0}},
+                'segments': [], 'off': True}
+
     sent = assign_sentences(rows)
     for s in set(r['sentence'] for r in rows):
         members = [r for r in rows if r['sentence'] == s]
@@ -558,7 +612,28 @@ def measure(path):
         for j, r in enumerate(members):
             r['sent_pos'] = j / (n - 1) if n > 1 else 0.0
 
+    # who each utterance is, against people already enrolled. Diarization says
+    # these are different voices; this says whose they are, or says unknown.
+    if speakers:
+        from recognize import identify_utterances
+        ident, _ = identify_utterances(
+            rows, diar.get('window_spans', []), diar.get('window_emb', []),
+            learning=False, source=path)
+    else:
+        ident = {}
+        for r in rows:
+            r['person'] = None
+            r['person_id'] = None
+            r['person_decision'] = 'unknown'
+            r['person_distance'] = None
+            r['person_confidence'] = 0.0
+
     return rows, {
+        'identification': {str(k): v for k, v in ident.items()},
+        'n_identified': sum(1 for v in ident.values()
+                            if v['decision'] != 'unknown'),
+        'n_unknown': sum(1 for v in ident.values()
+                         if v['decision'] == 'unknown'),
         'pitch_floor': p_floor,
         'pitch_ceiling': p_ceiling,
         'range_frames': len(pool),
@@ -578,6 +653,9 @@ def measure(path):
         'gap_only': sent['gap_only'],
         'both': sent['both'],
         'gap_decisions': sent['decisions'],
+        'diarization': diar,
+        'n_speakers': diar['n_speakers'],
+        'speaker_only_boundaries': sent['speaker_only'],
         'silence_log': silence_log(rows, total),
         'n_sentences': len(set(r['sentence'] for r in rows)),
         'p90_median': p90_median,

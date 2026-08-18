@@ -4,14 +4,14 @@ import parselmouth
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from faster_whisper import WhisperModel
+
+import speech
+from prosody_core import TRANSCRIBE_LOCALE
 
 path = sys.argv[1] if len(sys.argv) > 1 else "corpus/test.wav"
 out = sys.argv[2] if len(sys.argv) > 2 else "prosody.png"
 
-model = WhisperModel("small.en", device="cpu", compute_type="int8")
-segments, info = model.transcribe(path, word_timestamps=True, vad_filter=True)
-words = [w for seg in segments for w in seg.words]
+words, _ = speech.transcribe_file(path, TRANSCRIBE_LOCALE)
 
 snd = parselmouth.Sound(path)
 total = snd.get_total_duration()

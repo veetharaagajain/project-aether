@@ -358,8 +358,20 @@ def word_record(r):
     def n(x):
         return None if x is None or (isinstance(x, float) and np.isnan(x)) \
             else round(float(x), 4)
+    r = {'loud_z_lt': float('nan'), 'loud_z_st': float('nan'),
+         'dur_expected': float('nan'), 'dur_resid': float('nan'),
+         'pitch_resid': float('nan'), 'pause_before': float('nan'),
+         'pause_after': float('nan'), 'pause_raw': float('nan'), **r}
     return {
         'word': r['word'], 'punct': r['punct'],
+        'speaker': r.get('speaker', 1),
+        'speaker_source': r.get('speaker_source'),
+        'person': r.get('person'),
+        'person_id': r.get('person_id'),
+        'person_decision': r.get('person_decision', 'unknown'),
+        'person_distance': n(r.get('person_distance')),
+        'person_confidence': r.get('person_confidence', 0.0),
+        'scored': r.get('scored', True),
         'weight': n(r['weight']), 'cues_used': r['cues_used'],
         'start': n(r['start']), 'end': n(r['end']), 'dur': n(r['dur']),
         'orig_start': n(r['orig_start']), 'orig_end': n(r['orig_end']),
@@ -392,10 +404,16 @@ def utterances(rows, info, ref, total):
     for u, s in enumerate(sorted(set(r['sentence'] for r in rows))):
         idx = [i for i, r in enumerate(rows) if r['sentence'] == s]
         members = [rows[i] for i in idx]
+        sid = members[0].get('speaker', 1)
         if mode == 'distance-corrected':
             session_db = ref.get('loud_mu', float('nan')) + off
         else:
-            session_db = bl.file_loudness(rows, idx)
+            # the session level is this voice's own level in this recording,
+            # not the file's: two people at one microphone have two levels
+            same = [i for i, r in enumerate(rows)
+                    if r.get('speaker', 1) == sid]
+            session_db = bl.file_loudness([rows[i] for i in same],
+                                          [same.index(i) for i in idx])
         q_pitch, q_punct = is_question(members)
         fin_punct, fin_pitch = sounded_finished(rows, idx[-1])
         before = members[0]['gap_before'] if idx[0] else members[0]['start']
@@ -410,6 +428,15 @@ def utterances(rows, info, ref, total):
             'silence_before': round(float(before), 3),
             'silence_after': round(float(after), 3),
             'boundary_cue': members[0]['boundary_cue'] or 'start of file',
+            'speaker': sid,
+            'person': members[0].get('person'),
+            'person_id': members[0].get('person_id'),
+            'person_decision': members[0].get('person_decision', 'unknown'),
+            'person_distance': members[0].get('person_distance'),
+            'person_confidence': members[0].get('person_confidence', 0.0),
+            'speaker_changed': bool(u and out[-1]['speaker'] != sid),
+            'n_speakers': info.get('n_speakers', 1),
+            'scored': bool(members[0].get('scored', True)),
             'question_by_pitch_rise': q_pitch,
             'question_by_punctuation': q_punct,
             'finished_by_punctuation': fin_punct,
@@ -501,9 +528,32 @@ def apply_terminal(text, rec):
     return text, add_q, add_dash
 
 
+def speaker_prefix(rec):
+    """How a transcript marks who is talking: a label at the head of the turn.
+
+    This is the ordinary interview and hansard convention, "Speaker 1:", and a
+    model reads it without being told what it means. It appears only when the
+    recording holds more than one voice, and only on the first utterance of
+    each turn, because repeating it on every utterance of one turn is what a
+    badly made transcript looks like. The numbers are local to the recording:
+    diarization says these are different voices, not whose they are.
+    """
+    if rec.get('n_speakers', 1) < 2:
+        return ''
+    if rec.get('utterance', 0) and not rec.get('speaker_changed'):
+        return ''
+    who = rec.get('person')
+    if who and rec.get('person_decision') in ('confident', 'match'):
+        # a recognised person is named; an unrecognised voice keeps its
+        # diarization number, because a wrong name is worse than a number
+        return f"{who}: "
+    return f"Speaker {rec.get('speaker', 1)}: "
+
+
 def render_record(rec):
     """The whole rendered form for one utterance, from the record alone."""
     text, add_q, add_dash = apply_terminal(render_words(rec), rec)
+    text = speaker_prefix(rec) + text
     line = signal_line(rec)
     return (line + "\n" + text) if line else text
 
@@ -525,7 +575,7 @@ def main():
     speaker = sys.argv[2] if len(sys.argv) > 2 else "owner"
     limit = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 
-    rows, info, ref, stored = score_rows(path, speaker)
+    rows, info, ref, stored, refs = score_rows(path, speaker)
     us = utterances(rows, info, ref, info['total'])
     shown = us[:limit] if limit else us
 
@@ -534,6 +584,32 @@ def main():
     print(f"levels: light > {LEVEL_THRESHOLDS['light']}, "
           f"strong > {LEVEL_THRESHOLDS['strong']}; "
           f"pause mark at {ref.get('pause_cap_s', float('nan')):.2f} s")
+    d = info.get('diarization') or {}
+    print(f"speakers: {info.get('n_speakers', 1)} voice(s), "
+          f"{d.get('n_windows', 0)} window(s), "
+          f"{info.get('speaker_only_boundaries', 0)} utterance boundary(ies) "
+          f"forced by a change of voice")
+    for sid, entry in sorted(refs.items()):
+        share = (d.get('speakers') or {}).get(sid, {}).get('share', float('nan'))
+        print(f"  speaker {sid}: {entry['n_words']} usable word(s), "
+              f"{100*share:.0f}% of speech, reference {entry['kind']} "
+              f"-- {entry['why']}")
+    live = sc.live_cues(rows)
+    if len(live) < len(sc.CUE_COLUMN):
+        print("WARNING: only these emphasis cues are live: "
+              + ", ".join(live)
+              + ". Declination, the positional duration model and the "
+                "emphatic pause cap all come from a stored baseline, and a "
+                "within-file reference has none of them. The level "
+                "thresholds were derived against the full four-cue weight, "
+                "so marking on this file is not comparable.")
+    ident = info.get('identification') or {}
+    named = sorted({v['name'] for v in ident.values() if v.get('name')})
+    print(f"recognition: {info.get('n_identified', 0)} utterance(s) matched a "
+          f"known person, {info.get('n_unknown', 0)} unknown"
+          + (f"; recognised: {', '.join(named)}" if named else "")
+          + (f"  ({next(iter(ident.values()))['reason']})" if ident and not named
+             else ""))
     head = us[0] if us else {}
     print(f"loudness reference: {head.get('loudness_reference', 'n/a')} "
           f"({head.get('loudness_reference_why', '')})")
@@ -556,21 +632,46 @@ def main():
 
 def score_rows(path, speaker='owner'):
     """The same pipeline score.py runs, plus the question flag it does not
-    need and this does."""
+    need and this does, run once per voice in the recording.
+
+    Everything downstream of measurement is a comparison against a reference,
+    and a reference belongs to one voice. So the rows are split by speaker and
+    each subset is scored against its own reference. A voice with no reference
+    is scored not at all: its words keep their raw measurements and get no
+    z-scores, no weight and therefore no marks.
+    """
     rows, info = measure(path)
     store = bl.load()
-    stored = bool(store.get(speaker)) and bool(
-        store[speaker]['decl']['n_sentences'] or store[speaker]['pitch']['n'])
-    ref = bl.summary(store[speaker]) if stored else nz.per_file_reference(rows)
-    nz.apply_baselines(rows, ref)
-    nz.apply_rolling(rows, ref, stored)
-    nz.apply_defaults(rows)
-    nz.apply_stored_decline(rows, ref)
-    nz.flag_questions(rows, ref, stored)
-    sc.apply_duration_position(rows, ref)
-    sc.apply_pause(rows, ref, info['total'])
-    sc.apply_weight(rows)
-    return rows, info, ref, stored
+    refs = nz.per_speaker_references(rows, store, speaker)
+
+    for sid, entry in refs.items():
+        idx = {i for i, r in enumerate(rows) if r.get('speaker', 1) == sid}
+        mine = [rows[i] for i in sorted(idx)]
+        ref = entry['ref']
+        if ref is None:
+            for r in mine:
+                for k in ('pitch_z', 'loud_z', 'dur_z', 'pitch_resid_z',
+                          'dur_resid_z', 'pause_z', 'weight'):
+                    r[k] = float('nan')
+                r['cues_used'] = ''
+                r['dur_pos_class'] = bl.position_class(r)
+                r['question'] = False
+                r['scored'] = False
+            continue
+        nz.apply_baselines(mine, ref)
+        nz.apply_rolling(mine, ref, entry['stored'])
+        nz.apply_defaults(mine)
+        nz.apply_stored_decline(mine, ref)
+        nz.flag_questions(mine, ref, entry['stored'])
+        sc.apply_duration_position(mine, ref)
+        sc.apply_pause(rows, ref, info['total'], only=idx)
+        sc.apply_weight(mine)
+        for r in mine:
+            r['scored'] = True
+
+    main_id = max(refs, key=lambda s: refs[s]['n_words'])
+    return rows, info, refs[main_id]['ref'] or nz.per_file_reference(rows), \
+        refs[main_id]['stored'], refs
 
 
 if __name__ == "__main__":
