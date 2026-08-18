@@ -77,13 +77,36 @@ DISTANCE_MIN_SAME_FILES = 4
 
 
 # --- storage -----------------------------------------------------------------
-def load():
+def load(check=True):
+    """The stored baselines, refusing to hand back any that were built under a
+    measurement configuration this run does not use.
+
+    This is the choke point on purpose: score.score_file, markers.score_rows
+    and live.SessionState all reach the stored numbers through here, so one
+    check covers every path that can produce a scored word. check=False exists
+    for the two callers that legitimately need to see a stale baseline --
+    baseline.py reset, which is about to delete it, and provenance reporting.
+    """
     if not BASELINE_PATH.exists():
         return {}
-    return json.loads(BASELINE_PATH.read_text())
+    store = json.loads(BASELINE_PATH.read_text())
+    if check:
+        import provenance as pv
+        for speaker, stats in sorted(store.items()):
+            pv.check_baseline(speaker, stats, str(BASELINE_PATH))
+    return store
 
 
 def save(store):
+    """Write, stamping every speaker with what it was just built under.
+
+    The stamp is applied here rather than in accumulate() so that no path can
+    write a baseline without one: an unstamped baseline is indistinguishable
+    from one built before this check existed, and load() rejects both.
+    """
+    import provenance as pv
+    for stats in store.values():
+        stats['provenance'] = pv.stamp(stats)
     BASELINE_PATH.write_text(json.dumps(store, indent=2, sort_keys=True) + "\n")
 
 
@@ -142,6 +165,17 @@ def file_loudness(rows, exclude=()):
     v = [r['int_p90'] for i, r in enumerate(rows)
          if i not in ex and not r['suspect'] and not np.isnan(r['int_p90'])]
     return float(np.median(v)) if v else float('nan')
+
+
+# What the accumulation itself assumes: which sentences are long enough to
+# contribute a declination fit, how wide the short-term window is, where the
+# emphatic pause cap is cut, and what an utterance has to be to count. Watched
+# by provenance.py. BASELINE_PATH is not watched: where the file lives does not
+# change what is in it.
+PROVENANCE = ('MIN_SENTENCE_WORDS', 'SHORT_TERM_WINDOW_S',
+              'SHORT_TERM_MIN_WORDS', 'EMPHATIC_CAP_PCT', 'POSITION_CLASSES',
+              'UTT_MIN_WORDS', 'UTT_STATS', 'UTT_KEEP_RAW',
+              'DISTANCE_MIN_STEP_RATIO', 'DISTANCE_MIN_SAME_FILES')
 
 
 def utterance_stats(members, session_db=float('nan')):
@@ -595,7 +629,9 @@ def main():
         print(__doc__.strip())
         return 1
     cmd, speaker = sys.argv[1], sys.argv[2]
-    store = load()
+    # reset is the remedy for a stale baseline, so it has to be able to
+    # load one; every other command goes through the check.
+    store = load(check=(cmd != "reset"))
 
     if cmd == "add":
         paths = sys.argv[3:]

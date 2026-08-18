@@ -43,16 +43,39 @@ import normalize as nz
 import score as sc
 from prosody_core import measure
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # --- the one named place for the notation ------------------------------------
 MARK = {2: ('**', '**'), 1: ('*', '*'), 0: ('', '')}
+
+# An utterance shorter than this gets no emphasis marks. A mark is a claim
+# that one word stood out from the others, and a lone word has no others: the
+# rendered "**Stop.**" says only that the utterance was loud, which is what the
+# signal line is for. The threshold is two rather than the three that
+# baseline.UTT_MIN_WORDS uses for the signal line, because the two are gating
+# different claims. rate and the spreads genuinely need three points. A mark
+# needs a contrast, and two words supply one: across the corpus every marked
+# word in a two-word utterance is carried by loudness against the speaker's
+# own baseline, loud_z 2.9 to 6.1 on the four "stop" tokens in drag1, with
+# pitch in range and no pause contribution. Those are real and a minimum of
+# three would discard them.
+#
+# What this excludes is one-word utterances, which are 36 of 186 stored live
+# utterances and, once measure() segments first, 65 of 576 corpus ones. It
+# silences four marked words across the corpus, of which tone1's shouted
+# "Stop." is a real measurement: loud_z 6.5, pitch in range. A mark cannot
+# express it, having nothing to contrast it against, and the signal line
+# cannot either, needing three words for a rate. The weight is still on the
+# record; what is lost is only the ability to render it. It is applied here at render time and
+# not in score.apply_weight, so the continuous weight stays in the record and
+# a stored transcript can be recut under a different minimum.
+MARK_MIN_WORDS = 2
 PAUSE_MARK = '...'
 UNFINISHED_MARK = '—'          # em dash
 SENTENCE_FINAL = '.!?…'
 
 # Level thresholds on the continuous weight, derived by derive_levels() over
-# the whole corpus: stress1, neutral1, tone1, drag1, turns1, 673 non-suspect
+# the whole corpus: stress1, neutral1, tone1, drag1, turns1, 674 non-suspect
 # words. They are not round numbers and were not chosen to make any particular
 # word come out marked.
 #
@@ -62,7 +85,111 @@ SENTENCE_FINAL = '.!?…'
 # an entirely unmarked distribution would have. 'light' is where more than half
 # the words above it have no unmarked counterpart below it, and 'strong' is the
 # median of that unaccounted-for population.
-LEVEL_THRESHOLDS = {'light': 0.962, 'strong': 1.408}
+#
+# Rederived twice, and both times because something under them moved.
+#
+# The pair before these, 0.962 and 1.408, was derived under faster-whisper.
+# SpeechAnalyzer reports word spans on a 60 ms grid and cuts words in
+# different places, which moves the duration cue and the weight under it;
+# rederiving against the whole-file Apple transcript gave 1.042 and 1.518.
+#
+# Then prosody_core.measure began segmenting on silence before transcribing,
+# which stopped the recogniser running a phrase-final word out into the
+# following silence: across the corpus that cut words with a reported span
+# over LONG_WORD_S from 96 to 26.
+#
+# That last change also invalidated the stored baseline, which had been
+# accumulated over the whole-file path and still carried the stretched spans
+# in its duration statistics. Rebuilding it halved dur_resid_sd, 0.387 s to
+# 0.200 s, which is the denominator of the duration z and therefore roughly
+# doubled that cue everywhere. These are derived against a rebuilt baseline
+# and the path that actually runs, over 692 non-suspect words. Both have to
+# move together: rederiving these against a whole-file baseline is what
+# produced the intermediate 0.973 and 1.491, which fitted neither.
+LEVEL_THRESHOLDS = {'light': 1.143, 'strong': 1.659}
+
+# What these were cut against. Not decoration: provenance.check_levels compares
+# every entry of 'config' against the configuration this run measures under,
+# and 'baseline_digest' against the content of the baseline actually loaded, so
+# thresholds cut against a superseded baseline cannot quietly go on marking
+# words. Both halves are needed. The config catches a changed pipeline; the
+# digest catches the case that actually happened, where the pipeline was
+# unchanged but the baseline underneath had been rebuilt.
+#
+# `markers.py levels <corpus>` prints a replacement for this block. It is
+# pasted rather than written by the program because a constant the program can
+# rewrite is a constant nobody reviews.
+LEVEL_PROVENANCE = {   'baseline_digest': 'c8f25c83f065204d092dad55d8a74b8e',
+    'baseline_speaker': 'owner',
+    'config': {   'baseline.DISTANCE_MIN_SAME_FILES': 4,
+                  'baseline.DISTANCE_MIN_STEP_RATIO': 0.25,
+                  'baseline.EMPHATIC_CAP_PCT': 80.0,
+                  'baseline.MIN_SENTENCE_WORDS': 4,
+                  'baseline.POSITION_CLASSES': ['initial', 'middle', 'final'],
+                  'baseline.SHORT_TERM_MIN_WORDS': 20,
+                  'baseline.SHORT_TERM_WINDOW_S': 180.0,
+                  'baseline.UTT_KEEP_RAW': True,
+                  'baseline.UTT_MIN_WORDS': 3,
+                  'baseline.UTT_STATS': [   'rate',
+                                            'loud_mean',
+                                            'loud_rel',
+                                            'loud_sd',
+                                            'pitch_sd'],
+                  'config_version': 1,
+                  'measure.segmented': True,
+                  'prosody_core.ENVELOPE_HOP_S': 0.01,
+                  'prosody_core.ENVELOPE_WINDOW_S': 0.025,
+                  'prosody_core.LONG_WORD_MIN_VOICED': 5,
+                  'prosody_core.LONG_WORD_S': 1.2,
+                  'prosody_core.MIN_SILENCE_S': 0.15,
+                  'prosody_core.MIN_VOICED_FRAMES': 3,
+                  'prosody_core.NOISE_MARGIN_DB': 6.0,
+                  'prosody_core.OCTAVE_FACTOR': 2.0,
+                  'prosody_core.OCTAVE_MAX_PASSES': 5,
+                  'prosody_core.PITCH_CEILING_HZ': 300.0,
+                  'prosody_core.PITCH_FALL_LOOKBACK': 0,
+                  'prosody_core.PITCH_FALL_MIN_RATIO': 0.05,
+                  'prosody_core.PITCH_FLOOR_HZ': 60.0,
+                  'prosody_core.PROBE_CEILING_HZ': 500.0,
+                  'prosody_core.PROBE_FLOOR_HZ': 50.0,
+                  'prosody_core.QUIET_MARGIN_DB': 12.0,
+                  'prosody_core.RANGE_ABS_CEILING_HZ': 600.0,
+                  'prosody_core.RANGE_ABS_FLOOR_HZ': 40.0,
+                  'prosody_core.RANGE_CEILING_FACTOR': 1.5,
+                  'prosody_core.RANGE_FLOOR_FACTOR': 0.75,
+                  'prosody_core.RANGE_HIGH_PCT': 95.0,
+                  'prosody_core.RANGE_LOW_PCT': 5.0,
+                  'prosody_core.RANGE_MIN_FRAMES': 100,
+                  'prosody_core.SENTENCE_FINAL_PUNCT': '.!?…',
+                  'prosody_core.SENTENCE_GAP_ALWAYS_S': 2.0,
+                  'prosody_core.SENTENCE_GAP_MIN_S': 0.6,
+                  'prosody_core.SILENCE_DROP_DB': 15.0,
+                  'prosody_core.TRAILING_PUNCT': '.,!?;:…"\')]}',
+                  'prosody_core.TRANSCRIBE_LOCALE': 'en_US',
+                  'score.CUE_COLUMN': {   'dur': 'dur_resid_z',
+                                          'loud': 'loud_z',
+                                          'pause': 'pause_z',
+                                          'pitch': 'pitch_resid_z'},
+                  'score.WEIGHTS': {   'dur': 0.25,
+                                       'loud': 0.45,
+                                       'pause': 0.1,
+                                       'pitch': 0.2},
+                  'segment.CLOSE_S': 0.3,
+                  'segment.FRAME': 512,
+                  'segment.MAX_SEGMENT_S': 12.0,
+                  'segment.MIN_SEGMENT_S': 0.2,
+                  'segment.OPEN_FRAMES': 2,
+                  'segment.PREROLL_S': 0.25,
+                  'segment.SR': 16000,
+                  'segment.VAD_THRESHOLD': 0.5,
+                  'transcriber.bridge_source': 'b29729ceecf12bd1',
+                  'transcriber.engine': 'SpeechAnalyzer'},
+    'corpus': [   'corpus/stress1.wav',
+                  'corpus/neutral1.wav',
+                  'corpus/tone1.wav',
+                  'corpus/drag1.wav',
+                  'corpus/turns1.wav'],
+    'n_words': 692}
 
 # A pause gets its own mark once it reaches the stored emphatic cap, which is
 # the point at which the pause cue saturates in score.py. Below the cap a
@@ -494,13 +621,18 @@ def signal_line(rec):
 
 
 def render_words(rec):
-    """The words with their marks, from the stored continuous weights."""
+    """The words with their marks, from the stored continuous weights.
+
+    An utterance below MARK_MIN_WORDS renders unmarked. The weights are still
+    there in the record; this decides only what the string shows.
+    """
     cap = rec.get('pause_cap_s')
+    markable = len(rec['words']) >= MARK_MIN_WORDS
     out = []
     for k, w in enumerate(rec['words']):
         if k and cap is not None and (w['gap_before'] or 0.0) >= cap:
             out.append(PAUSE_MARK)
-        open_, close = MARK[level(w['weight'])]
+        open_, close = MARK[level(w['weight'])] if markable else ('', '')
         out.append(f"{open_}{w['word']}{close}{w['punct']}")
     return ' '.join(out)
 
@@ -560,15 +692,33 @@ def render_record(rec):
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == 'levels':
+        import provenance as pv
+        speaker = LEVEL_PROVENANCE.get('baseline_speaker', 'owner')
         pool = []
-        for p in sys.argv[2:]:
-            rows, _, _, _ = score_rows(p)
+        paths = sys.argv[2:]
+        for p in paths:
+            rows, _, _, _, _ = score_rows(p, speaker, check_levels=False)
             pool += [r['weight'] for r in rows if not r['suspect']]
         d = derive_levels(pool)
         print(f"over {d['n']} non-suspect words, median {d['median']:.3f}, "
               f"about {d['marked_est']} of them marked")
         print(f"light {d['light']}   strong {d['strong']}")
         print(f"currently in LEVEL_THRESHOLDS: {LEVEL_THRESHOLDS}")
+        print()
+        print("paste both of these into markers.py:")
+        print()
+        print(f"LEVEL_THRESHOLDS = {{'light': {d['light']}, "
+              f"'strong': {d['strong']}}}")
+        stats = bl.load()[speaker]
+        block = {'baseline_speaker': speaker,
+                 'baseline_digest': pv.content_digest(stats),
+                 'corpus': list(paths), 'n_words': d['n'],
+                 'config': pv.current()}
+        # pprint and not json.dumps: this is pasted into a .py file, and JSON
+        # writes true, false and null, none of which Python will import.
+        import pprint
+        print("LEVEL_PROVENANCE = " + pprint.pformat(block, indent=4,
+                                                     sort_dicts=True))
         return
 
     path = sys.argv[1] if len(sys.argv) > 1 else "corpus/test.wav"
@@ -630,7 +780,7 @@ def main():
         print(json.dumps(u, separators=(',', ':')))
 
 
-def score_rows(path, speaker='owner'):
+def score_rows(path, speaker='owner', check_levels=True):
     """The same pipeline score.py runs, plus the question flag it does not
     need and this does, run once per voice in the recording.
 
@@ -642,6 +792,14 @@ def score_rows(path, speaker='owner'):
     """
     rows, info = measure(path)
     store = bl.load()
+    # bl.load has already refused a baseline built under another pipeline. This
+    # is the other half: thresholds cut against another baseline. check_levels
+    # is off only for `markers.py levels`, which exists to rederive them and
+    # would otherwise be unable to run whenever it was most needed.
+    if check_levels and speaker in store:
+        import provenance as pv
+        pv.check_levels(LEVEL_PROVENANCE, store[speaker], speaker,
+                        str(bl.BASELINE_PATH))
     refs = nz.per_speaker_references(rows, store, speaker)
 
     for sid, entry in refs.items():

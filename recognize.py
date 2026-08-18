@@ -85,13 +85,56 @@ CONSOLIDATE_EVERY = 16  # confident matches between consolidation passes
 
 
 # --- storage ----------------------------------------------------------------
-def load():
+def load(check=True):
+    """The enrolled people, refusing fingerprints from a different model.
+
+    An empty store is never stale: there is nothing in it to be incomparable.
+    """
     if not PEOPLE_PATH.exists():
         return {'version': SCHEMA_VERSION, 'people': {}}
-    return json.loads(PEOPLE_PATH.read_text())
+    store = json.loads(PEOPLE_PATH.read_text())
+    if check and store.get('people'):
+        want = embedding_config()
+        got = store.get('embedding')
+        if got != want:
+            raise StaleFingerprints(
+                "The enrolled fingerprints came out of a different embedding "
+                "setup.\n"
+                f"  stored in: {PEOPLE_PATH}\n"
+                f"  was: {got}\n"
+                f"  now: {want}\n\n"
+                "Cosine distances across two models are still numbers and will "
+                "still\nname people, wrongly. Nothing will run until this is "
+                "resolved.\n\n"
+                "To resolve, re-enrol everyone against the current model.")
+    return store
+
+
+# What makes a stored fingerprint comparable to a freshly computed one: the
+# weights it came out of, and the preprocessing diarize.embed applied on the
+# way in. The match thresholds are deliberately not here -- they change what is
+# decided with the vectors, not whether the vectors mean the same thing, and
+# folding them in would force a re-enrolment every time one was tuned.
+def embedding_config():
+    import diarize as dz
+    return {'model': 'speechbrain/spkrec-ecapa-voxceleb',
+            'revision': dz.model_revision(),
+            'rate': dz.MODEL_RATE,
+            'length_normalised': True,
+            'min_span_s': 0.3}
+
+
+class StaleFingerprints(Exception):
+    """Stored fingerprints came out of a different embedding model.
+
+    Cosine distances between vectors from two different models are still
+    numbers, and still land inside MATCH_MAX often enough to name the wrong
+    person, so this cannot be a warning either.
+    """
 
 
 def save(store):
+    store['embedding'] = embedding_config()
     PEOPLE_PATH.write_text(json.dumps(store, indent=1, sort_keys=True) + "\n")
 
 

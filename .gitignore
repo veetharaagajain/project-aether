@@ -14,3 +14,12 @@ bridge/transcribe
 bridge/stream
 bridge/lang
 bridge/*.dSYM
+bridge/daemon
+bridge/compare
+bridge/probe
+bridge/transcribe
+bridge/stream
+bridge/lang
+
+# audio blobs: private speech, kept locally, never committed
+store/audio/

@@ -49,6 +49,12 @@ CUE_COLUMN = {
 }
 
 
+# The weight is a weighted sum of named columns; changing either the weights or
+# which column each cue reads makes every stored weight incomparable. Watched
+# by provenance.py.
+PROVENANCE = ('WEIGHTS', 'CUE_COLUMN')
+
+
 def apply_pause(rows, ref, total, only=None):
     """The emphatic pause: a short beat around a word, and nothing else.
 

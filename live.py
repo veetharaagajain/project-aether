@@ -35,23 +35,18 @@ from pathlib import Path
 
 import numpy as np
 
+import archive as ar
 import baseline as bl
 import markers as mk
 import normalize as nz
 import prosody_core as pc
 import score as sc
 
-SR = 16000
-FRAME = 512                  # silero-vad wants exactly this at 16 kHz, 32 ms
-
-# --- the gate ---------------------------------------------------------------
-VAD_THRESHOLD = 0.5          # silero's own speech probability
-OPEN_FRAMES = 2              # consecutive speech frames to open a segment
-CLOSE_S = 0.30               # quiet needed to close one
-PREROLL_S = 0.25             # audio kept from before the gate opened, so the
-                             # first consonant is not clipped off
-MAX_SEGMENT_S = 12.0         # hard cap, so one long turn is not one long wait
-MIN_SEGMENT_S = 0.20         # shorter than this is a click, not speech
+# The gate and its constants live in segment.py, because the batch path now
+# cuts speech the same way and the two must not drift apart. They are bound
+# here under their original names so this file reads as it always did.
+from segment import (SR, FRAME, VAD_THRESHOLD, OPEN_FRAMES, CLOSE_S,
+                     PREROLL_S, MAX_SEGMENT_S, MIN_SEGMENT_S, Gate)
 
 # --- what the session carries forward ---------------------------------------
 PITCH_CLOUD_MAX = 40000      # probe frames kept for the derived pitch range
@@ -92,7 +87,14 @@ class SessionState:
         self.words = deque(maxlen=WORD_HISTORY_MAX)
         self.n_segments = 0
         self.n_words = 0
+        # bl.load refuses a baseline built under another pipeline; this adds
+        # the threshold half, so the live path cannot mark words with levels
+        # cut against a baseline that has since been rebuilt either.
         self.store = bl.load()
+        if self.store.get(speaker):
+            import provenance as pv
+            pv.check_levels(mk.LEVEL_PROVENANCE, self.store[speaker], speaker,
+                            str(bl.BASELINE_PATH))
         self.stored_ok = bool(self.store.get(speaker)) and bool(
             self.store[speaker]['decl']['n_sentences']
             or self.store[speaker]['pitch']['n'])
@@ -105,6 +107,8 @@ class SessionState:
         self.locale = locale or pc.TRANSCRIBE_LOCALE
         self.people = None       # loaded lazily by recognition
         self.timings = []
+        import provenance as pv
+        self.config_digest = pv.digest(pv.current())
 
     # -- levels ------------------------------------------------------------
     def observe_levels(self, db, speaking):
@@ -148,78 +152,6 @@ class SessionState:
         v = [r['int_p90'] for r in self.words
              if not r['suspect'] and not np.isnan(r['int_p90'])]
         return float(np.median(v)) if len(v) >= 8 else float('nan')
-
-
-# --- the gate ---------------------------------------------------------------
-class Gate:
-    """silero-vad, plus the hysteresis that turns per-frame probabilities into
-    segments. Nothing expensive runs unless this says someone is talking."""
-
-    def __init__(self):
-        from silero_vad import load_silero_vad
-        import torch
-        self.torch = torch
-        self.model = load_silero_vad()
-        self.model.reset_states()
-        self.open = False
-        self.speech_run = 0
-        self.quiet_run = 0
-        self.buf = []
-        self.pre = deque(maxlen=int(PREROLL_S * SR / FRAME))
-        self.start_t = 0.0
-        self.just_opened = False
-        self.dropped_short = False
-
-    def push(self, frame, t):
-        """One 512-sample frame in; (closed segment or None, speech probability).
-
-        The probability comes back out so the caller can report what the
-        detector actually thought, which is the difference between "nobody
-        spoke" and "the detector never fired".
-        """
-        frame = np.ascontiguousarray(
-            (frame[:, 0] if frame.ndim > 1 else frame), dtype='float32')
-        if len(frame) != FRAME:
-            raise ValueError(
-                f"the gate needs exactly {FRAME} samples at {SR} Hz, got "
-                f"{len(frame)}. silero rejects anything else.")
-        p = float(self.model(self.torch.from_numpy(frame), SR).item())
-        speech = p >= VAD_THRESHOLD
-        self.just_opened = False
-
-        if not self.open:
-            self.pre.append(frame)
-            self.speech_run = self.speech_run + 1 if speech else 0
-            if self.speech_run >= OPEN_FRAMES:
-                self.open = True
-                self.just_opened = True
-                self.buf = list(self.pre)
-                self.start_t = t - len(self.buf) * FRAME / SR
-                self.quiet_run = 0
-            return None, p
-
-        self.buf.append(frame)
-        self.quiet_run = 0 if speech else self.quiet_run + 1
-        dur = len(self.buf) * FRAME / SR
-
-        if self.quiet_run * FRAME / SR >= CLOSE_S:
-            return self._close('silence'), p
-        if dur >= MAX_SEGMENT_S:
-            return self._close('length cap'), p
-        return None, p
-
-    def _close(self, reason):
-        audio = np.concatenate(self.buf) if self.buf else np.zeros(0, dtype='float32')
-        start = self.start_t
-        self.open = False
-        self.buf = []
-        self.pre.clear()
-        self.speech_run = self.quiet_run = 0
-        self.model.reset_states()
-        if len(audio) / SR < MIN_SEGMENT_S:
-            self.dropped_short = True
-            return None
-        return audio, start, reason
 
 
 # --- measurement on a segment ----------------------------------------------
@@ -274,11 +206,30 @@ def measure_segment(audio, t0, session, gap_before):
     pc.flag_suspect(rows, p90_median=session.p90_median())
 
     # feed the session before the segment is scored, so the next segment is
-    # measured against a range and a median that include this one
+    # measured against a range and a median that include this one.
+    #
+    # The cloud takes only the frames prosody_core.derive_pitch_range says it
+    # takes: inside a word that was not flagged suspect, and surviving octave
+    # rejection within that word. Handing it every voiced frame in the segment
+    # instead put breath, room noise and the gaps between words into the
+    # percentiles it brackets the speaker with, and its docstring already
+    # named the consequence -- a 572.9 Hz ceiling on turns1 for a voice that
+    # lives between 90 and 140. Replayed through this path, turns1 derived a
+    # median ceiling of 567.0 Hz and read 21 words above 250 Hz, one of them
+    # at 558.4 Hz on a speaker whose baseline is 102.
     probe = snd.to_pitch(pitch_floor=pc.PROBE_FLOOR_HZ,
                          pitch_ceiling=pc.PROBE_CEILING_HZ)
+    probe_t = probe.xs()
     ph = probe.selected_array['frequency']
-    session.pitch_cloud.extend(ph[(ph > 0) & ~np.isnan(ph)].tolist())
+    for r in rows:
+        if r['suspect']:
+            continue
+        v = ph[(probe_t >= r['start']) & (probe_t <= r['end'])]
+        v = v[(v > 0) & ~np.isnan(v)]
+        if not len(v):
+            continue
+        v, _, _ = pc.reject_octave_errors(v)
+        session.pitch_cloud.extend(v.tolist())
     session.p90.extend(r['int_p90'] for r in rows if not np.isnan(r['int_p90']))
 
     # absolute time, and the real gap before the first word: the segment's own
@@ -292,6 +243,15 @@ def measure_segment(audio, t0, session, gap_before):
         r['speaker_source'] = 'live, single stream'
 
     pc.assign_sentences(rows)
+    # The gate opened this segment after CLOSE_S of quiet, so the silence
+    # before its first word is an utterance boundary by construction.
+    # assign_sentences cannot know that: it only ever looks at word i against
+    # word i-1, so the first word of a segment comes out with no cue, and
+    # baseline.eligible_gaps then reads the whole inter-segment silence as an
+    # emphatic pause around that word. That put the first word of 83 of the
+    # 186 stored live utterances at the pause cap, against 0 of 109 in the
+    # batch corpus, where assign_sentences sees the boundary and excludes it.
+    rows[0]['boundary_cue'] = rows[0]['boundary_cue'] or 'segment'
     for s in set(r['sentence'] for r in rows):
         members = [r for r in rows if r['sentence'] == s]
         n = len(members)
@@ -373,13 +333,23 @@ def handle_segment(audio, t0, session, gap_before, out=sys.stdout):
     lines = [mk.render_record(u) for u in us]
     t_render = time.perf_counter() - t_render
 
+    # Keep the audio. It is stored once per run, whole and before anything has
+    # decided who was speaking, and every utterance in the run points at that
+    # one blob with its own offset. Measuring a segment and dropping it left
+    # nothing to re-transcribe when a better recogniser arrives and nothing
+    # for the bottom rung of the memory ladder to read.
+    t_arch = time.perf_counter()
+    blob = ar.put(audio, SR)
+    t_arch = time.perf_counter() - t_arch
+
     session.words.extend(rows)
     session.n_segments += 1
     session.n_words += len(rows)
     total = time.perf_counter() - wall
     timing = {'transcribe': stamps['transcribe'], 'measure': stamps['measure'],
               'score': t_score, 'fingerprint': t_fp,
-              'match': t_rec - t_fp, 'render': t_render, 'total': total,
+              'match': t_rec - t_fp, 'render': t_render, 'archive': t_arch,
+              'total': total,
               'audio_s': len(audio) / SR, 'words': len(rows)}
     session.timings.append(timing)
 
@@ -387,6 +357,25 @@ def handle_segment(audio, t0, session, gap_before, out=sys.stdout):
         for u in us:
             u['segment'] = session.n_segments
             u['segment_start'] = round(t0, 3)
+            # how this record finds its own audio: the blob is the whole run,
+            # offset is where this utterance starts inside it
+            u['audio'] = dict(blob, offset=round(u['start'] - t0, 3))
+            # what the pitch was measured against. 'fallback' means the fixed
+            # 60-300 range, which a session only ever uses for its first
+            # segment, before the cloud has enough clean frames to derive one
+            # and when the speaker has no stored baseline to borrow from. Those
+            # words are the ones a voice near either rail is read worst at, and
+            # recording the source is what makes them findable later: the audio
+            # is now archived, so they can be re-measured rather than trusted.
+            u['pitch_range'] = {'floor': round(info['pitch_range'][0], 1),
+                                'ceiling': round(info['pitch_range'][1], 1),
+                                'source': info['pitch_range'][2]}
+            # what this record was measured under. The weights in it are
+            # computed once and stored, never recomputed, so a record outlives
+            # the configuration that produced it and nothing else on the line
+            # would say so. Pooling records across a configuration change is
+            # the same mistake the baseline made, one level up.
+            u['config_digest'] = session.config_digest
             u['timing'] = {k: round(v, 4) for k, v in timing.items()}
             f.write(json.dumps(u, separators=(',', ':')) + "\n")
 

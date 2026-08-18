@@ -134,6 +134,10 @@ def per_file_reference(rows):
 # feeds is meant to describe the voice, not the session.
 DEFAULT_REFERENCE = {'pitch': 'lt', 'loud': 'lt', 'dur': 'st'}
 
+# Which reference each cue is expressed against, and how many words a
+# reference needs before it is one. Watched by provenance.py.
+PROVENANCE = ('MIN_REF_WORDS', 'DEFAULT_REFERENCE')
+
 
 def apply_defaults(rows):
     """Expose the chosen reference under a plain name, both still present."""

@@ -71,6 +71,24 @@ MIN_SILENCE_S = 0.150        # shorter dips than this are not pauses
 TRANSCRIBE_LOCALE = "en_US"
 
 
+# Everything here that moves a measured number, watched by provenance.py so a
+# baseline or a threshold derived under one set of these cannot be silently
+# used under another. FILLER_WORDS and SILENCE_LOG_MIN_S are deliberately out:
+# both only annotate the silence log, which is reported separately and never
+# reaches the weight.
+PROVENANCE = (
+    'PITCH_FLOOR_HZ', 'PITCH_CEILING_HZ', 'PROBE_FLOOR_HZ', 'PROBE_CEILING_HZ',
+    'RANGE_LOW_PCT', 'RANGE_HIGH_PCT', 'RANGE_FLOOR_FACTOR',
+    'RANGE_CEILING_FACTOR', 'RANGE_MIN_FRAMES', 'RANGE_ABS_FLOOR_HZ',
+    'RANGE_ABS_CEILING_HZ', 'MIN_VOICED_FRAMES', 'QUIET_MARGIN_DB',
+    'LONG_WORD_S', 'LONG_WORD_MIN_VOICED', 'SENTENCE_GAP_MIN_S',
+    'SENTENCE_GAP_ALWAYS_S', 'PITCH_FALL_LOOKBACK', 'PITCH_FALL_MIN_RATIO',
+    'TRAILING_PUNCT', 'SENTENCE_FINAL_PUNCT', 'OCTAVE_FACTOR',
+    'OCTAVE_MAX_PASSES', 'ENVELOPE_HOP_S', 'ENVELOPE_WINDOW_S',
+    'SILENCE_DROP_DB', 'NOISE_MARGIN_DB', 'MIN_SILENCE_S', 'TRANSCRIBE_LOCALE',
+)
+
+
 def energy_envelope(snd):
     """Short-time RMS of the whole file, in dB, one value per hop.
 
@@ -353,7 +371,7 @@ def assign_sentences(rows):
     recorded so their contributions stay separable.
     """
     candidates = gap_boundaries = rejected = 0
-    punct_only = gap_only = both = speaker_only = 0
+    punct_only = gap_only = both = speaker_only = segment_only = 0
     decisions = []
     run_start = 0
     for i, r in enumerate(rows):
@@ -365,6 +383,16 @@ def assign_sentences(rows):
             if r.get('speaker') != rows[i - 1].get('speaker'):
                 speaker_only += 1
                 r['boundary_cue'] = 'speaker'
+                run_start = i
+                r['sentence'] = run_start
+                continue
+            # a change of run, when the audio was cut before it was
+            # transcribed. The detector heard CLOSE_S of quiet here, which is
+            # an observation and not an inference from a reported gap, so it
+            # is not put to the gap rule for confirmation.
+            if r.get('segment_index') != rows[i - 1].get('segment_index'):
+                segment_only += 1
+                r['boundary_cue'] = 'segment'
                 run_start = i
                 r['sentence'] = run_start
                 continue
@@ -409,6 +437,7 @@ def assign_sentences(rows):
         'gap_only': gap_only,
         'both': both,
         'speaker_only': speaker_only,
+        'segment_only': segment_only,
         'decisions': decisions,
     }
 
@@ -440,6 +469,7 @@ def build_rows(words, silences, pitch_t, pitch_hz, int_t, int_db, total):
             'n_voiced_raw': len(v_raw),
             'n_octave_removed': n_oct,
             'octave_passes': oct_passes,
+            'segment_index': getattr(w, 'seg', 0),
             'orig_start': w.start,
             'orig_end': w.end,
             'orig_dur': w.end - w.start,
@@ -544,7 +574,7 @@ def silence_log(rows, total):
     return log
 
 
-def measure(path, speakers=True, locale=None):
+def measure(path, speakers=True, locale=None, segmented=True):
     import speech
     # vad_filter has no equivalent here. faster-whisper used it to skip
     # non-speech regions, mostly to stop the decoder hallucinating text into
@@ -556,7 +586,24 @@ def measure(path, speakers=True, locale=None):
     # it is ever measured; it now arrives, gets trimmed to nothing and gets
     # flagged. On turns1, which is 76 percent silence, this produced no flood
     # of spurious words: 517 against base.en's 508.
-    words, _ = speech.transcribe_file(path, locale or TRANSCRIBE_LOCALE)
+    # Cut the audio into runs of speech before transcribing, the way the live
+    # path does, rather than handing the recogniser the whole file. Two things
+    # follow. A boundary between runs is something the detector observed, not
+    # something the gap-and-punctuation rule inferred afterwards. And no word
+    # can be given an end time out in the silence that follows its phrase,
+    # because that silence is not inside the run: on the whole file
+    # SpeechAnalyzer ended "topics" 2.3 s after the speaker stopped saying it,
+    # and its duration, pitch and intensity were all measured over that span.
+    #
+    # segmented=False keeps the old whole-file call, which is what the
+    # comparison in the report was run against and what a file with no
+    # detectable silence structure still needs.
+    if segmented:
+        import segment as sg
+        words, seg_meta = sg.transcribe_runs(path, locale or TRANSCRIBE_LOCALE)
+    else:
+        words, _ = speech.transcribe_file(path, locale or TRANSCRIBE_LOCALE)
+        seg_meta = None
 
     snd = parselmouth.Sound(path)
     total = snd.get_total_duration()
@@ -656,6 +703,8 @@ def measure(path, speakers=True, locale=None):
         'diarization': diar,
         'n_speakers': diar['n_speakers'],
         'speaker_only_boundaries': sent['speaker_only'],
+        'segment_boundaries': sent['segment_only'],
+        'segmentation': seg_meta,
         'silence_log': silence_log(rows, total),
         'n_sentences': len(set(r['sentence'] for r in rows)),
         'p90_median': p90_median,

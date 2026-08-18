@@ -66,6 +66,38 @@ MIN_SPEAKER_WINDOWS = 3    # absorbed into its nearest neighbour, not a speaker
 _MODEL = None
 
 
+def model_revision():
+    """Which weights the fingerprints came out of.
+
+    models/ecapa is a directory of symlinks into the HuggingFace cache, and
+    each one resolves to a path containing that snapshot's commit hash. That
+    hash is the cheap identity: no multi-megabyte checkpoint needs hashing to
+    know whether the model changed. Returns 'unresolved' when the files are
+    real rather than linked, which is honest rather than silently reassuring.
+    """
+    import os
+    from pathlib import Path
+    p = Path(MODEL_DIR) / "embedding_model.ckpt"
+    if not p.exists():
+        return 'missing'
+    # one hop, not resolve(): the link points into snapshots/<revision>/, and
+    # that file is itself a link on into blobs/<content hash>, so resolving the
+    # whole chain walks straight past the revision. Either identifies the
+    # weights, so the content hash is the fallback.
+    hops = []
+    try:
+        hops.append(os.readlink(p))
+    except OSError:
+        pass
+    hops.append(str(p.resolve()))
+    for want in (40, 64):
+        for h in hops:
+            for part in h.split('/'):
+                if len(part) == want and all(c in '0123456789abcdef' for c in part):
+                    return part
+    return 'unresolved'
+
+
 def model():
     """Loaded once. The import is here rather than at module scope so the rest
     of the layer does not pay for torch when diarization is switched off."""
