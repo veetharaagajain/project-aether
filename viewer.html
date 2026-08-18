@@ -1,0 +1,369 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>aether</title>
+<style>
+:root{--bg:#111316;--panel:#181b1f;--line:#2a2f36;--fg:#d8dde3;--dim:#8b949e;
+      --rec:#c62828;--pause:#2f3640;--mark:#ffd166;--ok:#3fb950;--no:#f85149}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+header{display:flex;align-items:center;gap:16px;padding:10px 14px;
+       border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5}
+#rec{font:600 15px/1 inherit;letter-spacing:.06em;padding:10px 14px;border-radius:3px}
+#rec.on{background:var(--rec);color:#fff}
+#rec.off{background:var(--pause);color:var(--dim);border:1px solid var(--line)}
+#counts{color:var(--dim)}
+button{font:inherit;background:#22262c;color:var(--fg);border:1px solid var(--line);
+       padding:7px 12px;border-radius:3px;cursor:pointer}
+button:hover{background:#2b3038}
+nav{display:flex;gap:2px;padding:0 14px;border-bottom:1px solid var(--line)}
+nav button{border:none;border-bottom:2px solid transparent;border-radius:0;background:none;
+           color:var(--dim);padding:9px 12px}
+nav button.sel{color:var(--fg);border-bottom-color:var(--mark)}
+main{padding:14px}
+section{display:none}section.sel{display:block}
+.row{border-bottom:1px solid var(--line);padding:7px 0}
+.meta{color:var(--dim);font-size:11px}
+.utt{font-size:15px;line-height:1.6}
+.utt strong{color:var(--mark);font-weight:700}
+.utt em{color:#e8c07d;font-style:normal;text-decoration:underline
+        var(--line) 2px;text-underline-offset:3px}
+.pause-mark{color:var(--dim)}
+.sig{color:#79c0ff;font-size:12px}
+.who{color:var(--ok)}.who.unknown{color:var(--dim)}
+.notrec{color:var(--no)}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;color:var(--dim);font-weight:400;font-size:11px;
+   border-bottom:1px solid var(--line);padding:5px 8px 5px 0}
+td{padding:4px 8px 4px 0;border-bottom:1px solid var(--line);vertical-align:top}
+tr.clk{cursor:pointer}tr.clk:hover{background:#1e2228}
+.pill{display:inline-block;padding:1px 6px;border-radius:9px;font-size:11px;
+      border:1px solid var(--line);color:var(--dim)}
+.pill.allowed{color:var(--ok);border-color:#1d4429}
+.pill.denied{color:var(--no);border-color:#5c2321}
+.pill.faint{color:#6e7681}
+.pill.sup{color:#d29922;border-color:#5a4213}
+.bar{display:inline-block;height:6px;background:var(--ok);vertical-align:middle;border-radius:2px}
+.bar.faint{background:#484f58}
+#detail{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;overflow:auto;z-index:9}
+#detail.on{display:block}
+#dbox{max-width:960px;margin:36px auto;background:var(--panel);
+      border:1px solid var(--line);border-radius:4px;padding:16px}
+#empty{color:var(--dim);padding:20px 0}
+input[type=search]{font:inherit;background:#22262c;color:var(--fg);
+  border:1px solid var(--line);padding:6px 9px;border-radius:3px;width:280px}
+h3{margin:16px 0 6px;font-size:12px;color:var(--dim);font-weight:400;
+   text-transform:uppercase;letter-spacing:.08em}
+code{color:var(--dim);font-size:11px}
+</style>
+
+<header>
+  <div id="rec" class="off">CONNECTING</div>
+  <button id="toggle">…</button>
+  <div id="counts"></div>
+  <div style="flex:1"></div>
+  <div class="meta" id="conn"></div>
+</header>
+<nav>
+  <button data-t="live" class="sel">live</button>
+  <button data-t="memory">memory</button>
+  <button data-t="log">access log</button>
+  <button data-t="approve">approval <span id="pcount"></span></button>
+</nav>
+<main>
+  <section id="live" class="sel">
+    <div id="empty">Nothing yet. Start <code>python live.py</code> — or
+      <code>python live.py --file corpus/turns1.wav</code> — and utterances appear here
+      as they are measured, whether or not anything is being stored.</div>
+    <div id="stream"></div>
+  </section>
+
+  <section id="memory">
+    <input type="search" id="q" placeholder="filter observations and beliefs">
+    <h3>Beliefs</h3><div id="beliefs"></div>
+    <h3>Observations</h3><div id="obs"></div>
+  </section>
+
+  <section id="log">
+    <div class="meta">Every call to the gate. Ids only: the log holds no content, and
+      this page does not resolve the ids back to text.</div>
+    <table><thead><tr><th>when</th><th>caller</th><th>tool</th><th></th>
+      <th>reason</th><th>results</th><th>arguments</th></tr></thead>
+      <tbody id="logrows"></tbody></table>
+  </section>
+  <section id="approve">
+    <div class="row">
+      <button id="modebtn">…</button>
+      <span class="meta" id="modenote"></span>
+    </div>
+    <h3>Waiting for you</h3><div id="pending"><div id="empty">Nothing waiting.</div></div>
+    <h3>Standing approvals</h3><div id="standing"></div>
+    <h3>Recently decided</h3><div id="decided"></div>
+  </section>
+</main>
+<div id="detail"><div id="dbox"></div></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const clock = t => t ? new Date(t*1000).toLocaleTimeString() : '';
+const day = t => t ? new Date(t*1000).toLocaleString() : '';
+
+// Emphasis is rendered, not printed. The weights are on the record and the
+// thresholds are fetched from the server, which reads them out of
+// markers.LEVEL_THRESHOLDS, so this page cannot drift into showing a different
+// two levels from the ones the notation actually emits. Nothing here is a copy.
+let LEVELS = null, MINWORDS = 2;
+function renderWords(rec){
+  const ws = (rec.words||[]);
+  const cap = rec.pause_cap_s;
+  const markable = LEVELS && ws.length >= MINWORDS;
+  let out = [];
+  ws.forEach((w,i) => {
+    if(i && cap != null && (w.gap_before||0) >= cap)
+      out.push('<span class="pause-mark">…</span>');
+    const t = esc(w.word) + esc(w.punct||'');
+    const wt = w.weight;
+    if(!markable || wt == null) out.push(t);
+    else if(wt > LEVELS.strong) out.push('<strong>'+t+'</strong>');
+    else if(wt > LEVELS.light) out.push('<em>'+t+'</em>');
+    else out.push(t);
+  });
+  return out.join(' ');
+}
+
+function utteranceRow(ev){
+  const r = ev.record || {};
+  const who = r.person && r.person_decision !== 'unknown'
+    ? '<span class="who">'+esc(r.person)+'</span>'
+    : '<span class="who unknown">unknown voice</span>';
+  // the English line above the utterance, when there is one, taken from what
+  // the live path already rendered rather than recomputed here
+  const lines = String(ev.rendered||'').split('\n');
+  const sig = lines.length > 1 ? '<div class="sig">'+esc(lines[0])+'</div>' : '';
+  const notrec = ev.capturing ? ''
+    : ' <span class="notrec">· not stored (paused)</span>';
+  return '<div class="row">'
+    + '<div class="meta">'+clock(ev.at)+' · '+who
+    + ' · seg '+esc(ev.segment)+' · '+(r.words||[]).length+' words'
+    + (r.pitch_range ? ' · pitch '+esc(r.pitch_range.source) : '')
+    + notrec+'</div>'
+    + sig
+    + '<div class="utt">'+renderWords(r)+'</div></div>';
+}
+
+function setRec(on, banner){
+  const el = $('#rec');
+  el.className = on ? 'on' : 'off';
+  el.textContent = on ? 'RECORDING' : 'PAUSED — NOT RECORDING';
+  el.title = banner || '';
+  $('#toggle').textContent = on ? 'pause' : 'resume';
+  $('#toggle').onclick = async () => {
+    $('#toggle').disabled = true;
+    await fetch(on ? '/api/pause' : '/api/resume', {method:'POST'});
+    $('#toggle').disabled = false; state();
+  };
+}
+
+async function state(){
+  const s = await (await fetch('/api/state')).json();
+  setRec(s.capturing, s.banner);
+  LEVELS = s.levels; MINWORDS = s.mark_min_words;
+  $('#counts').textContent =
+    s.observations+' observations · '+s.beliefs+' beliefs · '+s.calls+' gate calls';
+}
+
+async function memory(){
+  const q = $('#q').value.trim();
+  const m = await (await fetch('/api/memory?limit=60'+(q?'&q='+encodeURIComponent(q):''))).json();
+  $('#beliefs').innerHTML = m.beliefs.length ? m.beliefs.map(b => {
+    const w = Math.max(0, Math.min(1, b.weight));
+    return '<div class="row clk" onclick="showBelief(\''+b.id+'\')">'
+      + '<div>'+esc(b.statement)+'</div>'
+      + '<div class="meta">certainty '+b.certainty.toFixed(2)
+      + ' · weight '+b.weight.toFixed(3)
+      + ' <span class="bar'+(b.faint?' faint':'')+'" style="width:'+(w*60)+'px"></span>'
+      + (b.faint?' <span class="pill faint">faded</span>':'')
+      + (b.superseded?' <span class="pill sup">replaced</span>':'')
+      + ' · '+b.n_sources+' source'+(b.n_sources==1?'':'s')
+      + ' · returned '+b.times_returned+'×'
+      + ' · '+esc(b.author)+' · '+day(b.formed_at)+'</div></div>';
+  }).join('') : '<div id="empty">No beliefs yet.</div>';
+  $('#obs').innerHTML = m.observations.length ? m.observations.map(o =>
+    '<div class="row clk" onclick="showObs(\''+o.id+'\')">'
+    + '<div>'+esc(o.text)+'</div>'
+    + '<div class="meta">'+day(o.started_at)+' · '+esc(o.kind)
+    + ' · '+(o.person ? esc(o.person) : 'unknown')
+    + (o.has_audio ? ' · audio' : ' · no audio')
+    + ' · <code>'+esc(o.id)+'</code></div></div>').join('')
+    : '<div id="empty">No observations yet.</div>';
+}
+
+async function showBelief(id){
+  const b = await (await fetch('/api/belief/'+id)).json();
+  if(b.gone) return open_('<h3>gone</h3><div>'+esc(b.reason)+'</div>');
+  let h = '<h3>belief</h3><div class="utt">'+esc(b.statement)+'</div>'
+    + '<div class="meta">certainty '+b.certainty+' · weight '+b.weight
+    + (b.faint?' (faded)':'') + ' · formed '+day(b.formed_at)
+    + ' · by '+esc(b.author)+' · returned '+b.times_returned+'×'
+    + (b.about?' · about '+esc(b.about):'')+'</div>';
+  if(b.superseded) h += '<div class="meta">replaced by <a href="#" onclick="showBelief(\''
+    + b.replaced_by+'\');return false">'+esc(b.replaced_by)+'</a> · current is <a href="#" '
+    + 'onclick="showBelief(\''+b.current+'\');return false">'+esc(b.current)+'</a></div>';
+  if(b.replaces.length) h += '<h3>replaces</h3>' + b.replaces.map(r =>
+    '<div class="row"><a href="#" onclick="showBelief(\''+r.id+'\');return false">'
+    + esc(r.statement)+'</a><div class="meta">certainty '+r.certainty
+    + ' · formed '+day(r.formed_at)+'</div></div>').join('');
+  h += '<h3>drawn from — the record underneath it</h3>' + b.sources.map(s =>
+    s.gone ? '<div class="row meta">'+esc(s.id)+' — '+esc(s.reason)+'</div>'
+    : '<div class="row clk" onclick="showObs(\''+s.id+'\')">'+esc(s.text)
+      + '<div class="meta">'+day(s.started_at)+' · '+(s.person?esc(s.person):'unknown')
+      + (s.has_audio?' · audio':'')+'</div></div>').join('');
+  if(b.links.length) h += '<h3>other links</h3>' + b.links.map(l =>
+    '<div class="meta">'+esc(l.type)+' → '+esc(l.kind)+' '+esc(l.id)+'</div>').join('');
+  open_(h);
+}
+
+async function showObs(id){
+  const o = await (await fetch('/api/observation/'+id)).json();
+  if(o.gone) return open_('<h3>gone</h3><div>'+esc(o.reason)+'</div>');
+  const r = o.record || {};
+  let h = '<h3>observation</h3><div class="utt">'+renderWords(r)+'</div>'
+    + '<div class="meta">'+day(o.started_at)+' · '+esc(o.kind)
+    + ' · '+(o.person?esc(o.person):'unknown')+' ('+esc(o.person_decision)+')'
+    + (o.has_audio?' · audio archived':' · no audio')
+    + ' · measured under <code>'+esc(o.config_digest)+'</code></div>';
+  const s = r.signals || {};
+  h += '<h3>per word</h3><table><thead><tr><th>word</th><th>weight</th>'
+    + '<th>loud z</th><th>dur z</th><th>pitch z</th><th>pause z</th>'
+    + '<th>pitch</th><th>suspect</th></tr></thead><tbody>'
+    + (r.words||[]).map(w => '<tr><td>'+esc(w.word)+esc(w.punct||'')+'</td>'
+      + '<td>'+f(w.weight)+'</td><td>'+f(w.loud_z)+'</td><td>'+f(w.dur_resid_z)+'</td>'
+      + '<td>'+f(w.pitch_resid_z)+'</td><td>'+f(w.pause_z)+'</td>'
+      + '<td>'+f(w.pitch_med,1)+'</td>'
+      + '<td>'+(w.suspect?esc((w.suspect_reasons||[]).join('+')):'')+'</td></tr>').join('')
+    + '</tbody></table>';
+  if(s.measurable) h += '<div class="meta">rate '+f(s.rate)+' w/s · loud vs session '
+    + f(s.loud_rel)+' dB · loud spread '+f(s.loud_sd)+' · pitch spread '+f(s.pitch_sd)+'</div>';
+  open_(h);
+}
+const f = (v,d=2) => v==null ? '' : Number(v).toFixed(d);
+function open_(h){ $('#dbox').innerHTML =
+  '<button onclick="close_()" style="float:right">close</button>'+h;
+  $('#detail').classList.add('on'); }
+function close_(){ $('#detail').classList.remove('on'); }
+$('#detail').onclick = e => { if(e.target.id==='detail') close_(); };
+document.addEventListener('keydown', e => { if(e.key==='Escape') close_(); });
+
+// Approval. The preview of what would be handed over arrives on the live
+// channel and is kept here in the page only; the server never wrote it down.
+const PREVIEW = {};
+let APPROVALS = null;
+async function approvals(){
+  const a = await (await fetch('/api/approvals')).json();
+  APPROVALS = a;
+  $('#modebtn').textContent = a.mode ? 'approval ON — turn off' : 'approval OFF — turn on';
+  $('#modebtn').onclick = async () => {
+    await fetch('/api/approval-mode?on='+(a.mode?'0':'1'), {method:'POST'});
+    approvals();
+  };
+  $('#modenote').textContent = a.mode
+    ? 'Every release waits for you. '+a.timeout_s+'s with no answer denies it.'
+    : 'Releases are not being held. Turn on to see each one before it leaves.';
+  $('#pcount').textContent = a.pending.length ? '('+a.pending.length+')' : '';
+  $('#pending').innerHTML = a.pending.length ? a.pending.map(p => {
+    const prev = PREVIEW[p.id];
+    return '<div class="row"><div><b>'+esc(p.caller)+'</b> asked <b>'+esc(p.tool)+'</b>'
+      + ' · would hand over '+p.n_would_return+' item'+(p.n_would_return==1?'':'s')+'</div>'
+      + '<div class="meta">'+clock(p.at)+' · <code>'+esc(p.arguments)+'</code></div>'
+      + (prev && prev.length
+          ? '<div class="utt" style="font-size:13px;margin:6px 0">'
+            + prev.map(x => esc(x)).join('<br>') + '</div>'
+          : '<div class="meta">(preview not seen by this page — it arrives live; '
+            + 'only ids are stored)</div>')
+      + '<div style="margin-top:6px">'
+      + '<button onclick="decide(\''+p.id+'\',\'approved\')">approve once</button> '
+      + '<button onclick="decide(\''+p.id+'\',\'approved\','
+      + a.default_standing_minutes+')">approve '+esc(p.tool)+' from '
+      + esc(p.caller)+' for '+a.default_standing_minutes+' min</button> '
+      + '<button onclick="decide(\''+p.id+'\',\'denied\')">deny</button>'
+      + '</div></div>';
+  }).join('') : '<div id="empty">Nothing waiting.</div>';
+  $('#standing').innerHTML = a.standing.length ? a.standing.map(s => {
+    const left = s.expires_at ? Math.max(0,(s.expires_at*1000-Date.now())/60000) : null;
+    return '<div class="row"><b>'+esc(s.caller)+'</b> → '+esc(s.tool)
+      + ' <span class="meta">'+(left!=null?left.toFixed(0)+' min left':'no expiry')
+      + ' · '+esc(s.note||'')+'</span> '
+      + '<button onclick="revoke(\''+s.caller+'\',\''+s.tool+'\')">revoke</button></div>';
+  }).join('') : '<div class="meta">None. Every standing grant expires; there is no permanent one.</div>';
+  $('#decided').innerHTML = a.recent.map(r =>
+    '<div class="row meta">'+clock(r.at)+' · '+esc(r.caller)+' · '+esc(r.tool)
+    + ' · <span class="pill '+(r.decision=='approved'?'allowed':'denied')+'">'
+    + esc(r.decision)+'</span> · '+r.n_would_return+' item(s)'
+    + (r.standing_minutes?' · granted standing '+r.standing_minutes+' min':'')+'</div>').join('')
+    || '<div class="meta">Nothing decided yet.</div>';
+}
+async function decide(id, decision, mins){
+  await fetch('/api/'+(decision=='approved'?'approve':'deny')+'?id='+id
+    +(mins?'&standing_minutes='+mins:''), {method:'POST'});
+  approvals();
+}
+async function revoke(caller, tool){
+  await fetch('/api/revoke-standing?caller='+encodeURIComponent(caller)
+    +'&tool='+encodeURIComponent(tool), {method:'POST'});
+  approvals();
+}
+
+async function log(){
+  const rows = await (await fetch('/api/log?limit=120')).json();
+  $('#logrows').innerHTML = rows.map(r =>
+    '<tr><td>'+day(r.at)+'</td><td>'+esc(r.caller)+'</td><td>'+esc(r.tool)+'</td>'
+    + '<td><span class="pill '+esc(r.decision)+'">'+esc(r.decision)+'</span></td>'
+    + '<td>'+esc(r.reason)+'</td><td>'+r.n_returned+'</td>'
+    + '<td><code>'+esc(JSON.stringify(r.arguments))+'</code></td></tr>').join('')
+    || '<tr><td colspan="7" class="meta">No calls yet.</td></tr>';
+}
+
+// tabs
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('sel'));
+  document.querySelectorAll('section').forEach(x => x.classList.remove('sel'));
+  b.classList.add('sel'); $('#'+b.dataset.t).classList.add('sel');
+  if(b.dataset.t==='memory') memory();
+  if(b.dataset.t==='log') log();
+  if(b.dataset.t==='approve') approvals();
+});
+$('#q').oninput = () => memory();
+
+// the live stream. EventSource reconnects on its own, so a viewer restart or a
+// closed laptop recovers without a page reload.
+function addEvent(ev){
+  if(ev.kind === 'utterance'){
+    $('#empty').style.display = 'none';
+    $('#stream').insertAdjacentHTML('afterbegin', utteranceRow(ev));
+    while($('#stream').children.length > 200) $('#stream').lastChild.remove();
+    $('#counts') && state();
+  } else if(ev.kind === 'capture' || ev.kind === 'session'){
+    setRec(ev.capturing, ev.banner);
+  } else if(ev.kind === 'approval'){
+    PREVIEW[ev.id] = ev.preview || [];
+    approvals();
+    document.title = 'aether — approval waiting';
+  } else if(ev.kind === 'approval-resolved'){
+    delete PREVIEW[ev.id]; approvals(); document.title = 'aether';
+  }
+}
+function connect(){
+  const es = new EventSource('/events');
+  es.onopen = () => { $('#conn').textContent = 'live stream connected'; };
+  es.onmessage = e => addEvent(JSON.parse(e.data));
+  es.onerror = () => { $('#conn').textContent = 'live stream reconnecting…'; };
+}
+(async () => {
+  await state();
+  (await (await fetch('/api/recent')).json()).forEach(addEvent);
+  connect(); memory(); log(); approvals();
+  setInterval(state, 5000);
+})();
+</script>

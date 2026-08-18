@@ -9,23 +9,21 @@ out_*.txt
 models/
 people.json
 live_records.jsonl
-bridge/probe
-bridge/transcribe
-bridge/stream
-bridge/lang
-bridge/*.dSYM
+
+# compiled swift
 bridge/daemon
 bridge/compare
 bridge/probe
 bridge/transcribe
 bridge/stream
 bridge/lang
-
-# audio blobs: private speech, kept locally, never committed
-store/audio/
+bridge/*.dSYM
 
 # Xcode
 xcuserdata/
 DerivedData/
 *.xcuserstate
 build/
+
+# the memory store: one person's life. Never committed.
+store/

@@ -112,3 +112,110 @@ def usage():
         n += 1
         total += p.stat().st_size
     return {'blobs': n, 'bytes': total, 'mb': round(total / 1e6, 2)}
+
+
+# --- blobs nothing points at ------------------------------------------------
+# A blob is written when a segment is measured; its observation is written a
+# moment later. Anything that stops in between -- a crash, an interrupt, a
+# session run before the store existed at all -- leaves audio on disk that no
+# record refers to. That audio is unreachable by incognito.forget(), which
+# works from observations outward, so it is audio the person has no control
+# that can delete. That is the whole reason this exists.
+#
+# GRACE. A blob younger than GRACE_S is never swept, because "written but not
+# yet recorded" and "written and never recorded" look identical from here and
+# only time separates them. The live path writes the observation within
+# milliseconds of the blob, so an hour is enormous; it is set that way because
+# the cost of waiting is a little disk and the cost of being wrong is deleting
+# audio that was about to be referenced.
+GRACE_S = 3600.0
+
+
+def referenced(db):
+    """Every blob digest some observation still points at."""
+    return {r[0] for r in db.execute(
+        "SELECT DISTINCT audio_blob FROM observations "
+        "WHERE audio_blob IS NOT NULL")}
+
+
+def orphans(db, grace_s=GRACE_S, now=None):
+    """Blobs on disk that no observation refers to and that are old enough to
+    be sure about. Returns a list of (digest, bytes, age_seconds)."""
+    import time as _t
+    now = _t.time() if now is None else now
+    keep = referenced(db)
+    out = []
+    for p in sorted(ROOT.rglob("*" + SUFFIX)):
+        d = p.stem
+        if d in keep:
+            continue
+        st = p.stat()
+        age = now - st.st_mtime
+        if age < grace_s:
+            continue
+        out.append((d, st.st_size, age))
+    return out
+
+
+def sweep(db, apply=False, grace_s=GRACE_S, now=None):
+    """Report unreferenced blobs, and delete them when asked.
+
+    Reporting is the default and deleting is the flag, the same way
+    incognito.plan_forget precedes incognito.forget: this removes recordings,
+    and a destructive default is not something a person can safely re-run.
+
+    Each removal leaves a tombstone, so a device that had synced the blob
+    learns it is gone rather than offering it back.
+    """
+    import time as _t
+    found = orphans(db, grace_s=grace_s, now=now)
+    freed = 0
+    removed = []
+    if apply:
+        stamp = _t.time()
+        for d, size, _age in found:
+            p = path_for(d)
+            if p.exists():
+                p.unlink()
+                freed += size
+                removed.append(d)
+            db.execute("INSERT OR REPLACE INTO tombstones(id,kind,reason,at,"
+                       "device,hlc) VALUES(?,?,?,?,?,?)",
+                       (d, 'audio', 'swept: no observation referred to it',
+                        stamp, db.device, db.clock.tick()))
+        db.commit()
+        # empty fan-out directories left behind, so the archive does not
+        # accumulate 256 empty folders forever
+        for sub in sorted(ROOT.iterdir()):
+            if sub.is_dir() and not any(sub.iterdir()):
+                sub.rmdir()
+    return {'found': len(found), 'bytes': sum(f[1] for f in found),
+            'removed': len(removed), 'freed': freed,
+            'oldest_age_s': max((f[2] for f in found), default=0.0),
+            'digests': [f[0] for f in found]}
+
+
+def main():
+    import sys
+    import memory as mem
+    args = sys.argv[1:]
+    apply = '--apply' in args
+    grace = float(args[args.index('--grace') + 1]) if '--grace' in args else GRACE_S
+    db = mem.open()
+    u = usage()
+    r = sweep(db, apply=apply, grace_s=grace)
+    print(f"archive: {u['blobs']} blob(s), {u['mb']} MB")
+    print(f"referenced by an observation: {len(referenced(db))}")
+    print(f"unreferenced and older than {grace/3600:.2f} h: {r['found']} "
+          f"({r['bytes']/1e6:.2f} MB, oldest {r['oldest_age_s']/3600:.1f} h)")
+    if apply:
+        print(f"removed {r['removed']} blob(s), freed {r['freed']/1e6:.2f} MB, "
+              f"tombstoned each")
+        print(f"archive now: {usage()['blobs']} blob(s), {usage()['mb']} MB")
+    elif r['found']:
+        print("nothing removed. Re-run with --apply to delete them.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

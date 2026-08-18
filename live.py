@@ -27,6 +27,7 @@ usage:
 """
 
 import json
+import os
 import queue
 import sys
 import time
@@ -37,10 +38,13 @@ import numpy as np
 
 import archive as ar
 import baseline as bl
+import channel as ch
+import incognito as inc
 import markers as mk
 import normalize as nz
 import prosody_core as pc
 import score as sc
+import singleton
 
 # The gate and its constants live in segment.py, because the batch path now
 # cuts speech the same way and the two must not drift apart. They are bound
@@ -109,6 +113,24 @@ class SessionState:
         self.timings = []
         import provenance as pv
         self.config_digest = pv.digest(pv.current())
+        self.id = time.strftime('%Y%m%dT%H%M%S')
+        self._db = None
+        # read once at session start and cached: a pause taking effect only at
+        # the next session would be useless, so live_loop rechecks it, but a
+        # per-utterance database read is not what this is for.
+        self.capturing = True
+
+    def memory(self):
+        if self._db is None:
+            import memory as mem
+            self._db = mem.open()
+        return self._db
+
+    def check_capture(self):
+        import incognito as inc
+        was = self.capturing
+        self.capturing = inc.capturing(self.memory())
+        return was, self.capturing
 
     # -- levels ------------------------------------------------------------
     def observe_levels(self, db, speaking):
@@ -318,6 +340,34 @@ def recognise_segment(audio, rows, session):
     return time.perf_counter() - t, t_fp, res
 
 
+def store_utterances(session, us, t0, blob):
+    """Every utterance of this segment, into the memory store.
+
+    One observation per utterance rather than per segment, because an utterance
+    is the unit everything upstream already produces and the unit a question
+    will be answered with. kind is 'speech' so that sight does not need a
+    second table when it arrives.
+    """
+    import memory as mem
+    db = session.memory()
+    # session-relative seconds out, epoch seconds in. Everything upstream
+    # counts from the start of the session because that is what the measurement
+    # needs; the store needs wall time, because forget() works on a window of
+    # real minutes and a ULID carries the moment it was minted.
+    base = session.t0
+    for u in us:
+        mem.add_observation(
+            db, 'speech', base + u['start'], base + u['end'],
+            text=u['plain'], body=u,
+            session=session.id,
+            person_id=u.get('person_id'), person=u.get('person'),
+            person_decision=u.get('person_decision'),
+            speaker=u.get('speaker'),
+            audio=(dict(blob, offset=round(u['start'] - t0, 3))
+                   if blob else None),
+            config_digest=session.config_digest)
+
+
 def handle_segment(audio, t0, session, gap_before, out=sys.stdout):
     """One segment, all the way from audio to a rendered line and a record."""
     wall = time.perf_counter()
@@ -338,8 +388,13 @@ def handle_segment(audio, t0, session, gap_before, out=sys.stdout):
     # one blob with its own offset. Measuring a segment and dropping it left
     # nothing to re-transcribe when a better recogniser arrives and nothing
     # for the bottom rung of the memory ladder to read.
+    #
+    # Unless capture is paused. Everything above this line still ran: the
+    # segment was gated, transcribed and measured, so the session keeps its
+    # pitch range and its loudness reference and the first minute after
+    # resuming is not measured against nothing. What stops here is storage.
     t_arch = time.perf_counter()
-    blob = ar.put(audio, SR)
+    blob = ar.put(audio, SR) if session.capturing else None
     t_arch = time.perf_counter() - t_arch
 
     session.words.extend(rows)
@@ -353,31 +408,69 @@ def handle_segment(audio, t0, session, gap_before, out=sys.stdout):
               'audio_s': len(audio) / SR, 'words': len(rows)}
     session.timings.append(timing)
 
-    with RECORDS_PATH.open('a') as f:
-        for u in us:
-            u['segment'] = session.n_segments
-            u['segment_start'] = round(t0, 3)
-            # how this record finds its own audio: the blob is the whole run,
-            # offset is where this utterance starts inside it
-            u['audio'] = dict(blob, offset=round(u['start'] - t0, 3))
-            # what the pitch was measured against. 'fallback' means the fixed
-            # 60-300 range, which a session only ever uses for its first
-            # segment, before the cloud has enough clean frames to derive one
-            # and when the speaker has no stored baseline to borrow from. Those
-            # words are the ones a voice near either rail is read worst at, and
-            # recording the source is what makes them findable later: the audio
-            # is now archived, so they can be re-measured rather than trusted.
-            u['pitch_range'] = {'floor': round(info['pitch_range'][0], 1),
-                                'ceiling': round(info['pitch_range'][1], 1),
-                                'source': info['pitch_range'][2]}
-            # what this record was measured under. The weights in it are
-            # computed once and stored, never recomputed, so a record outlives
-            # the configuration that produced it and nothing else on the line
-            # would say so. Pooling records across a configuration change is
-            # the same mistake the baseline made, one level up.
-            u['config_digest'] = session.config_digest
-            u['timing'] = {k: round(v, 4) for k, v in timing.items()}
-            f.write(json.dumps(u, separators=(',', ':')) + "\n")
+    if session.capturing:
+        store_utterances(session, us, t0, blob)
+
+    for u in us:
+        u['segment'] = session.n_segments
+        u['segment_start'] = round(t0, 3)
+        # how this record finds its own audio: the blob is the whole run,
+        # offset is where this utterance starts inside it
+        u['audio'] = (dict(blob, offset=round(u['start'] - t0, 3))
+                      if blob else None)
+        # what the pitch was measured against. 'fallback' means the fixed
+        # 60-300 range, which a session only ever uses for its first
+        # segment, before the cloud has enough clean frames to derive one
+        # and when the speaker has no stored baseline to borrow from. Those
+        # words are the ones a voice near either rail is read worst at, and
+        # recording the source is what makes them findable later: the audio
+        # is now archived, so they can be re-measured rather than trusted.
+        u['pitch_range'] = {'floor': round(info['pitch_range'][0], 1),
+                            'ceiling': round(info['pitch_range'][1], 1),
+                            'source': info['pitch_range'][2]}
+        # what this record was measured under. The weights in it are
+        # computed once and stored, never recomputed, so a record outlives
+        # the configuration that produced it and nothing else on the line
+        # would say so. Pooling records across a configuration change is
+        # the same mistake the baseline made, one level up.
+        u['config_digest'] = session.config_digest
+        u['timing'] = {k: round(v, 4) for k, v in timing.items()}
+
+    # The record file is storage, so pause switches it off with everything
+    # else. It did not, until the viewer was built: a paused session was still
+    # leaving a transcript on disk, which is exactly what pause promises it
+    # will not do.
+    if session.capturing:
+        with RECORDS_PATH.open('a') as f:
+            for u in us:
+                f.write(json.dumps(u, separators=(',', ':')) + "\n")
+
+    # Published whether or not anything is being stored, and whether or not
+    # anything is listening. Watching and recording are independent: a person
+    # needs to be able to see that a paused session really is producing nothing.
+    #
+    # A view payload, not a copy of the record. The page renders words, marks
+    # and who was speaking, so that is what goes over the wire; anything wanting
+    # the z-scores and the audio pointer reads the stored observation through
+    # the viewer's own API. Keeping it small is also what keeps it inside one
+    # datagram on a long utterance.
+    for u, line in zip(us, lines):
+        ch.publish({
+            'kind': 'utterance', 'at': time.time(),
+            'capturing': session.capturing, 'session': session.id,
+            'segment': session.n_segments, 'rendered': line,
+            'record': {
+                'person': u.get('person'),
+                'person_decision': u.get('person_decision'),
+                'plain': u['plain'],
+                'pause_cap_s': u.get('pause_cap_s'),
+                'pitch_range': u.get('pitch_range'),
+                'start': u['start'], 'end': u['end'],
+                'words': [{'word': w['word'], 'punct': w['punct'],
+                           'weight': w['weight'],
+                           'gap_before': w['gap_before'],
+                           'suspect': w['suspect']} for w in u['words']],
+            }})
 
     who = ident.get('name') or 'unknown'
     print(f"[{t0:7.2f}s +{total*1000:5.0f}ms  {len(audio)/SR:4.1f}s audio, "
@@ -487,6 +580,15 @@ def run_stream(session, source, realtime=False, out=sys.stdout, meters=None,
         if closed is not None:
             m.closes += 1
             audio, start, reason = closed
+            # checked per segment, not per session: pausing has to take effect
+            # in the conversation it was asked for, and a segment is the
+            # smallest thing that can be wholly kept or wholly dropped.
+            was, now_on = session.check_capture()
+            if was != now_on:
+                print(f"  [{inc.banner(session.memory())}]", file=out, flush=True)
+                ch.publish({'kind': 'capture', 'at': time.time(),
+                            'capturing': now_on,
+                            'banner': inc.banner(session.memory())})
             r = handle_segment(audio, start, session,
                                max(0.0, start - last_end), out)
             if r is None:
@@ -632,11 +734,37 @@ def list_devices():
           "CoreAudio without raising. If in doubt use the built-in microphone.")
 
 
+# --- one live path at a time ------------------------------------------------
+# Two of these ran at once and nothing noticed. Both captured, both stored,
+# both published to the same socket, and the only visible symptom was the
+# viewer showing every utterance twice -- by which point 44 duplicate
+# observations were in the store, measured against two different session
+# references, with no way to say which copy was authoritative. The lock itself
+# is in singleton.py, shared with the viewer, which had the same failure.
+LOCK_PATH = singleton.lock_path('live')
+AlreadyRunning = singleton.AlreadyRunning
+
+
+def take_lock():
+    return singleton.take(
+        'live', 'live path',
+        "Two at once means both capture, both store, and every utterance is\n"
+        "written twice against two different session references.",
+        process='live.py')
+
+
 def main():
     args = sys.argv[1:]
     if '--devices' in args:
         list_devices()
         return
+    # before anything is opened, loaded or captured: a refusal after thirty
+    # seconds of model loading is a refusal nobody reads
+    try:
+        take_lock()
+    except AlreadyRunning as e:
+        print(f"refusing to start: {e}", file=sys.stderr)
+        return 1
     realtime = '--realtime' in args
     locale = args[args.index('--locale') + 1] if '--locale' in args else None
     session = SessionState(locale=locale)
@@ -651,6 +779,13 @@ def main():
     dz.embed(warm, SR, [(0.0, 1.0)])
     Gate()
     print(f"models loaded and warmed in {time.perf_counter()-t_warm:.1f}s")
+    # said once at the top, and again whenever it changes. The recording state
+    # is not something a person should have to go and ask for.
+    session.check_capture()
+    print(f"[{inc.banner(session.memory())}]")
+    ch.publish({'kind': 'session', 'at': time.time(), 'session': session.id,
+                'capturing': session.capturing,
+                'banner': inc.banner(session.memory())})
     capture = None
     if '--file' in args:
         path = args[args.index('--file') + 1]
@@ -727,4 +862,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
