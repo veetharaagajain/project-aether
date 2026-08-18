@@ -23,3 +23,9 @@ bridge/lang
 
 # audio blobs: private speech, kept locally, never committed
 store/audio/
+
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcuserstate
+build/
