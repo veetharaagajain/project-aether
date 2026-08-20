@@ -12,6 +12,14 @@ header{display:flex;align-items:center;gap:16px;padding:10px 14px;
 #rec{font:600 15px/1 inherit;letter-spacing:.06em;padding:10px 14px;border-radius:3px}
 #rec.on{background:var(--rec);color:#fff}
 #rec.off{background:var(--pause);color:var(--dim);border:1px solid var(--line)}
+/* Stale code. Above the header, full width, unmissable: the failure this
+   exists for was invisible for two hours in a log nobody read, so it is put
+   where the recording indicator is rather than anywhere quieter. */
+#stale{display:none;background:#7a1f1f;color:#ffe9e9;padding:9px 14px;
+       border-bottom:1px solid #a33;font-weight:600}
+#stale.on{display:block}
+#stale ul{margin:4px 0 0;padding-left:18px;font-weight:400;font-size:12px}
+#stale code{color:#ffd9d9}
 #counts{color:var(--dim)}
 button{font:inherit;background:#22262c;color:var(--fg);border:1px solid var(--line);
        padding:7px 12px;border-radius:3px;cursor:pointer}
@@ -57,6 +65,7 @@ h3{margin:16px 0 6px;font-size:12px;color:var(--dim);font-weight:400;
 code{color:var(--dim);font-size:11px}
 </style>
 
+<div id="stale"></div>
 <header>
   <div id="rec" class="off">CONNECTING</div>
   <button id="toggle">…</button>
@@ -166,9 +175,23 @@ function setRec(on, banner){
   };
 }
 
+function showStale(list){
+  const el = $('#stale');
+  if(!list || !list.length){ el.className=''; el.innerHTML=''; return; }
+  el.className='on';
+  el.innerHTML = list.map(p =>
+    'RUNNING OLD CODE — '+esc(p.kind)+' (pid '+p.pid+', started '
+    + clock(p.started_at)+') is executing files that have changed on disk since it started.'
+    + '<ul>' + p.changed.map(c =>
+        '<li><code>'+esc(c.path)+'</code> '+esc(c.what)+'</li>').join('')
+    + '</ul>Restart it. Until then it behaves as it did at '+clock(p.started_at)+'.'
+  ).join('<hr style="border-color:#a33">');
+}
+
 async function state(){
   const s = await (await fetch('/api/state')).json();
   setRec(s.capturing, s.banner);
+  showStale(s.stale_processes);
   LEVELS = s.levels; MINWORDS = s.mark_min_words;
   $('#counts').textContent =
     s.observations+' observations · '+s.beliefs+' beliefs · '+s.calls+' gate calls';

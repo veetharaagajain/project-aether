@@ -24,15 +24,23 @@ the old behaviour is worse than an outage -- it looks like it is working.
 """
 
 import json
+import select
 import subprocess
 import sys
 import threading
 import time
+
+import memory as mem
 from pathlib import Path
 
 BRIDGE = Path(__file__).resolve().parent / "bridge" / "relevance"
 SOURCE = Path(__file__).resolve().parent / "bridge" / "relevance.swift"
 DEFAULT_MODE = "each"
+# The bridge times out each candidate at PER_CALL_TIMEOUT_S and keeps going,
+# so this only fires if the bridge itself stops answering. Generous enough
+# not to race that mechanism, tight enough that a release cannot hang.
+REPLY_BASE_S = 20.0
+REPLY_PER_CANDIDATE_S = 15.0
 STARTUP_TIMEOUT_S = 30.0
 
 # How the gate behaves when the judge cannot run. Stored in meta, so it is the
@@ -159,6 +167,18 @@ def judge(question, candidates, mode=DEFAULT_MODE, concurrency=4):
             p.stdin.write(f"judge {len(payload)}\n".encode())
             p.stdin.write(payload)
             p.stdin.flush()
+            # A deadline, not a blocking read. The bridge bounds each candidate
+            # itself, so this is the backstop for the bridge as a whole going
+            # away or wedging below that level; without it a stuck model blocks
+            # the release waiting on it forever, which is how this was found.
+            budget = REPLY_BASE_S + REPLY_PER_CANDIDATE_S * len(candidates)
+            ready, _, _ = select.select([p.stdout], [], [], budget)
+            if not ready:
+                shutdown()
+                raise Unavailable(
+                    f"the relevance judge did not answer within {budget:.0f}s "
+                    f"for {len(candidates)} candidate(s); the bridge was "
+                    f"restarted and nothing was released")
             line = p.stdout.readline()
         except (BrokenPipeError, OSError) as e:
             shutdown()
@@ -174,6 +194,7 @@ def judge(question, candidates, mode=DEFAULT_MODE, concurrency=4):
     return r.get('keep', []), {
         'calls': r.get('calls', 0), 'seconds': r.get('seconds', 0.0),
         'per_call': r.get('perCall', []), 'mode': r.get('mode', mode),
+        'needs_context': set(r.get('needsContext', [])),
         'partial_error': r.get('error')}
 
 
@@ -196,8 +217,19 @@ def set_policy(db, mode):
 def narrow(db, question, hits, text_of=lambda h: h.get('text', '')):
     """Narrow search hits to the ones that answer the question.
 
-    Returns (kept_hits, note). note says what happened, and is written into the
-    access log so a narrow release and a failed judge do not look alike.
+    Each observation is judged inside its neighbourhood rather than alone. The
+    store is chunked by silence, so an observation is one run of speech: the
+    median is four words and 59 percent are four or fewer. Judging those alone
+    threw away answers that were split mid-sentence -- "Charitable trust and not
+    a public authority under the RTI Act" was rejected because nothing in it
+    says which fund, and the line naming the fund was 0.42 seconds earlier.
+
+    Beliefs are judged as they are. A belief is already a whole statement
+    written to stand alone, and it has no position in a session to reach from.
+
+    Returns (kept_hits, note). Kept hits carry 'role': 'answer' for the fragment
+    that was judged, 'context' for a neighbour released with it. note is written
+    into the access log so a narrow release and a failed judge do not look alike.
     """
     mode = policy(db)
     if mode == 'off':
@@ -205,17 +237,59 @@ def narrow(db, question, hits, text_of=lambda h: h.get('text', '')):
                             'reason': 'relevance judging is switched off'}
     if not hits:
         return [], {'judged': False, 'policy': mode, 'reason': 'nothing to judge'}
+
+    windows, prompts = [], []
+    for h in hits:
+        if h.get('kind') == 'observation' and h.get('id'):
+            rows = mem.neighbourhood(db, h['id'])
+            windows.append(rows)
+            prompts.append(mem.window_text(rows) if rows else text_of(h))
+        else:
+            windows.append(None)
+            prompts.append(f">> {text_of(h)}")
     try:
-        keep, meta = judge(question, [text_of(h) for h in hits])
+        keep, meta = judge(question, prompts)
     except Unavailable as e:
         raise Unavailable(
             f"the relevance judge could not run ({e}), and the policy is "
             f"'required', so nothing was released. This is not an empty "
             f"result: the store was not consulted for an answer. Set the "
             f"policy to 'off' to release unnarrowed search results.") from e
-    kept = [h for i, h in enumerate(hits) if i in set(keep)]
+
+    needs = meta.get('needs_context') or set()
+    kept, seen, n_ctx = [], set(), 0
+    for i in sorted(set(keep)):
+        h = dict(hits[i], role='answer')
+        if h.get('id') in seen:
+            continue
+        seen.add(h.get('id'))
+        kept.append(h)
+        if i not in needs or not windows[i]:
+            continue
+        # Only the neighbours tight enough to be the same run of speech, and
+        # only the ones adjacent to the fragment. The judge saw two either side;
+        # releasing all four because one was needed would hand over three
+        # utterances nobody asked about.
+        by_offset = {r['offset']: r for r in windows[i]}
+        for off in (-1, 1):
+            r = by_offset.get(off)
+            if r is None or r['id'] in seen:
+                continue
+            # 'gap' on a row is the silence before that row, so the silence
+            # separating a neighbour from the target is the target's own gap on
+            # the left and the neighbour's own gap on the right.
+            sep = by_offset[0]['gap'] if off == -1 else r['gap']
+            if sep > mem.NEIGHBOUR_TIGHT_GAP_S:
+                continue
+            seen.add(r['id'])
+            n_ctx += 1
+            kept.append({'kind': 'observation', 'id': r['id'], 'text': r['text'],
+                         'at': r['started_at'], 'score': hits[i].get('score'),
+                         'role': 'context', 'context_for': hits[i]['id'],
+                         'separation_s': round(float(sep), 2)})
     return kept, {'judged': True, 'policy': mode, 'considered': len(hits),
-                  'kept': len(kept), 'seconds': round(meta['seconds'], 3),
+                  'kept': len(kept), 'answers': len(kept) - n_ctx,
+                  'context': n_ctx, 'seconds': round(meta['seconds'], 3),
                   'calls': meta['calls'], 'partial_error': meta.get('partial_error')}
 
 

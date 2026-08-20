@@ -31,12 +31,36 @@ import secrets
 import time
 
 import memory as mem
+import staleness
 
 import incognito as inc
 import memory as mem
 
 TOOLS = ('search_memory', 'fetch_observation', 'fetch_belief',
          'write_belief', 'record_answer')
+
+# The modules that decide what leaves and how narrowly. Staleness in any of
+# them is refused at the point of release; staleness anywhere else is only
+# reported. See release().
+RELEASE_PATH = ('gate.py', 'relevance.py', 'memory.py')
+
+# How many candidates the judge sees by default.
+#
+# Ten was a guess made before retrieval worked. Measured now over the seven
+# evaluation questions, the first answer sits at rank 1 for five of six and at
+# rank 3 for the sixth, so the tail of a ten-candidate list is almost entirely
+# things that were never close -- and each one still costs a model call and can
+# still be released wrongly. Going from ten to five keeps every answer ten
+# found, cuts false releases from 7 to 4, and halves the time: precision 0.46
+# to 0.60, 4.8 s to 2.5 s per question.
+#
+# Three measured better still -- precision 0.67, 1.6 s -- and is not the default
+# because one question already has its answer at exactly rank 3, so it has no
+# margin at all for retrieval shifting. Five is three plus room to be wrong.
+#
+# The caller can always ask for more, and should when it wants recall over
+# precision: twenty finds one further answer, at rank 15, for double the time.
+DEFAULT_SEARCH_LIMIT = 5
 DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 8787
 LOCAL_ONLY = ('127.0.0.1', '::1', 'localhost')
@@ -376,6 +400,27 @@ def release(db, caller, tool, args, results, preview):
     nothing of what that name concluded a month ago. Every release goes to the
     person or to a standing approval they granted.
     """
+    # WARN EVERYWHERE, REFUSE HERE. A process holding stale code is a warning
+    # in the viewer, because editing a file while something runs is ordinary and
+    # a server that kills itself over it is unusable. But the release path is
+    # the exception, and it is the exception for the same reason provenance.py
+    # raises rather than prints: a stale gate does not fail, it succeeds
+    # wrongly, and what it succeeds at is handing over a person's speech that
+    # the current code would have withheld. That is not an inconvenience to be
+    # noticed later.
+    #
+    # This refuses one call, not the process. The connection survives, the
+    # caller gets a real error naming the file, and the person sees it in the
+    # viewer -- rather than the server dropping a live conversation because
+    # somebody saved an editor buffer.
+    drift = staleness.am_i_stale(RELEASE_PATH, db=db)
+    if drift:
+        files = ", ".join(f"{p} ({w})" for p, w in drift)
+        return False, (
+            f"this process is running code older than what is on disk: {files}. "
+            f"The release path decides what leaves the store and how narrowly, "
+            f"so a stale copy of it releases what the current code would not. "
+            f"Restart the server; nothing else needs changing.")
     if not approval_mode(db):
         return True, 'approval off'
     st = standing(db, caller, tool)
@@ -415,7 +460,7 @@ def _shape_belief(b):
 
 
 # --- the four tools, as plain functions -------------------------------------
-def search_memory(db, caller, secret, query, limit=10, kinds=None,
+def search_memory(db, caller, secret, query, limit=DEFAULT_SEARCH_LIMIT, kinds=None,
                   include_superseded=False):
     args = {'query': query, 'limit': limit, 'kinds': kinds,
             'include_superseded': include_superseded}

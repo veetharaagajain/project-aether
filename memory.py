@@ -48,10 +48,48 @@ import time
 import uuid
 from pathlib import Path
 
+import numpy as np
+
 DB_PATH = Path(__file__).resolve().parent / "store" / "memory.db"
-EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+# An ASYMMETRIC model, and that is the whole point of the choice.
+#
+# all-MiniLM-L6-v2 embeds a query and a stored sentence the same way, so a
+# question in the store sits next to a question in the query: "What did you
+# have for breakfast?" scored 0.79 against a query phrased as a question while
+# the answer scored 0.45. No chunking fixes that, because it is not about
+# chunk size -- it is the model putting questions near questions.
+#
+# e5 encodes the two sides differently, and the prefixes below are how it is
+# told which side it is looking at. They are load-bearing, not decorative:
+# measured on the breakfast case, the stored question beats the answer by 0.052
+# with the prefixes and by 0.0798 without, so using the model unprefixed throws
+# away a third of what it was chosen for and would do it silently.
+#
+# It is also multilingual, which matters because the Kannada and Hindi speech in
+# this store cannot be embedded meaningfully by an English-only model at all.
+EMBED_MODEL = "intfloat/multilingual-e5-small"
 EMBED_DIMS = 384
-SCHEMA_VERSION = 1
+QUERY_PREFIX = "query: "
+PASSAGE_PREFIX = "passage: "
+SCHEMA_VERSION = 2
+
+# How the text behind a vector was assembled, not just what embedded it.
+#
+# The model check alone was insufficient in exactly the way provenance.py was
+# written about. Two vectors from the same model, one made from an observation
+# alone and one from a window of neighbouring speech, are the same shape and
+# the same scale and compare happily, and the comparison means nothing. A store
+# half-indexed each way would rank incoherently with nothing noticing, because
+# every check it had was still passing.
+#
+# So the recipe is recorded beside the model and checked the same way. Bump
+# INDEX_RECIPE whenever the text that goes into an embedding changes -- the
+# unit, the bounds, the separator, anything. It is a name and a version rather
+# than a hash of the parameters, because a person reading a refusal needs to
+# know what changed, and "window-v1 became window-v2" says more than two
+# digests do.
+INDEX_UNIT = "window"          # 'observation' = the old scheme, one vector each
+INDEX_RECIPE = "window-v2-e5-prefixed"
 
 # Decay is applied when a belief is read rather than on a timer, so nothing has
 # to run in the background for the numbers to be right. HALF_LIFE_DAYS is how
@@ -131,6 +169,7 @@ CREATE TABLE IF NOT EXISTS observations (
   speaker       INTEGER,
   text          TEXT NOT NULL,          -- plain words, for search and embedding
   body          TEXT NOT NULL,          -- the full record as JSON, weights and all
+  is_question   INTEGER NOT NULL DEFAULT 0,  -- either question signal fired
   audio_blob    TEXT,                   -- digest into archive.py, may be NULL
   audio_offset  REAL,
   audio_seconds REAL,
@@ -212,6 +251,39 @@ CREATE TABLE IF NOT EXISTS access_log (
 CREATE INDEX IF NOT EXISTS log_at ON access_log(at);
 CREATE INDEX IF NOT EXISTS log_caller ON access_log(caller);
 
+-- How an observation is found, which is not what an observation is. A window is
+-- a short run of consecutive speech centred on one observation; the vector for
+-- it lives in win_vec. Windows are derived, disposable and rebuilt by
+-- build_windows(); nothing here is a record and nothing here is ever released.
+CREATE TABLE IF NOT EXISTS windows (
+  id         TEXT PRIMARY KEY,
+  centre_id  TEXT NOT NULL,          -- the observation this window is FOR
+  session    TEXT,
+  first_id   TEXT NOT NULL,
+  last_id    TEXT NOT NULL,
+  n_obs      INTEGER NOT NULL,
+  n_words    INTEGER NOT NULL,
+  started_at REAL NOT NULL,
+  ended_at   REAL NOT NULL,
+  text       TEXT NOT NULL,
+  recipe     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS win_centre ON windows(centre_id);
+CREATE INDEX IF NOT EXISTS win_session ON windows(session, started_at);
+
+-- Which long-lived processes are running and what code they hold. A process
+-- that imported gate.py at 11:12 is still executing the 11:12 version at 13:53,
+-- and nothing else in this store can tell. staleness.py writes here; viewer.py
+-- reads it and shows anything stale in the header.
+CREATE TABLE IF NOT EXISTS processes (
+  pid        INTEGER PRIMARY KEY,
+  kind       TEXT NOT NULL,           -- 'mcp' | 'viewer' | 'live'
+  started_at REAL NOT NULL,
+  last_seen  REAL NOT NULL,
+  argv       TEXT,
+  modules    TEXT NOT NULL DEFAULT '{}'
+);
+
 -- Manual approval. A request waits here until a person decides, or until it
 -- times out. Content is deliberately NOT stored: the row keeps ids and counts,
 -- the same rule the access log follows, and the preview of what would actually
@@ -284,6 +356,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS obs_vec USING vec0(
   id TEXT PRIMARY KEY,
   embedding float[{EMBED_DIMS}] distance_metric=cosine
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS win_vec USING vec0(
+  id TEXT PRIMARY KEY,
+  embedding float[{EMBED_DIMS}] distance_metric=cosine
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS bel_vec USING vec0(
   id TEXT PRIMARY KEY,
   embedding float[{EMBED_DIMS}] distance_metric=cosine
@@ -330,6 +406,16 @@ def open(path=None, check_vectors=True):
     db.enable_load_extension(False)
     db.executescript(SCHEMA)
     db.executescript(VEC_SCHEMA)
+    # CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
+    # a column added to SCHEMA never reaches a store made before it. Adding them
+    # explicitly is the only way; each is nullable or defaulted so an existing
+    # row is valid the moment it appears.
+    for table, column, decl in (
+            ('observations', 'is_question', 'INTEGER NOT NULL DEFAULT 0'),):
+        have = {r['name'] for r in db.execute(f"PRAGMA table_info({table})")}
+        if column not in have:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    db.commit()
     # stores written before callers had secrets. Adding the columns leaves
     # every existing caller with NULL, which authenticate() treats as
     # unusable -- the failure mode asked for.
@@ -340,19 +426,27 @@ def open(path=None, check_vectors=True):
             db.execute(f"ALTER TABLE callers ADD COLUMN {col} {decl}")
 
     want = {"schema_version": str(SCHEMA_VERSION),
-            "embed_model": EMBED_MODEL, "embed_dims": str(EMBED_DIMS)}
+            "embed_model": EMBED_MODEL, "embed_dims": str(EMBED_DIMS),
+            "index_unit": INDEX_UNIT, "index_recipe": INDEX_RECIPE}
     for k, v in want.items():
         row = db.execute("SELECT value FROM meta WHERE key=?", (k,)).fetchone()
         if row is None:
             db.execute("INSERT INTO meta(key,value) VALUES(?,?)", (k, v))
         elif row[0] != v and check_vectors:
-            n = db.execute("SELECT count(*) FROM obs_vec").fetchone()[0]
+            n = (db.execute("SELECT count(*) FROM obs_vec").fetchone()[0]
+                 + db.execute("SELECT count(*) FROM win_vec").fetchone()[0]
+                 + db.execute("SELECT count(*) FROM bel_vec").fetchone()[0])
             if n:
                 raise StaleVectors(
-                    f"This store's {k} is {row[0]!r}; this build uses {v!r}, and "
-                    f"there are {n} stored vectors.\nDistances between vectors "
-                    "from two models are still numbers and still rank results,\n"
-                    "wrongly. Re-embed everything or open a different store.")
+                    f"This store's {k} is {row[0]!r}; this build uses {v!r}, "
+                    f"and there are {n} stored vector(s).\n"
+                    "Vectors made under two different settings are the same "
+                    "shape and the same scale, so they\ncompare without "
+                    "complaint and rank wrongly. Nothing here can tell them "
+                    "apart after the fact.\n\n"
+                    "To resolve:\n"
+                    "    python memory.py reindex        rebuild every vector "
+                    "under the current settings")
             db.execute("UPDATE meta SET value=? WHERE key=?", (v, k))
     db.commit()
     # The gate protects the MCP surface; the filesystem protects the file. A
@@ -385,11 +479,25 @@ def embedder():
     return _MODEL
 
 
-def embed(texts):
-    import numpy as np
-    v = embedder().encode(list(texts), normalize_embeddings=True,
+def embed(texts, kind="passage"):
+    """Embed text, telling the model which side of the comparison it is.
+
+    kind must be 'passage' for anything stored and 'query' for anything asked.
+    Getting it backwards produces numbers of the right shape and scale that
+    rank wrongly, with nothing to notice it -- so the argument has no default
+    that could quietly be wrong in the common case, and every caller says which
+    it means.
+    """
+    if kind not in ("passage", "query"):
+        raise ValueError("kind must be 'passage' or 'query', not %r" % (kind,))
+    pre = PASSAGE_PREFIX if kind == "passage" else QUERY_PREFIX
+    v = embedder().encode([pre + t for t in texts], normalize_embeddings=True,
                           show_progress_bar=False)
     return np.asarray(v, dtype="float32")
+
+
+def embed_query(text):
+    return embed([text], kind="query")[0]
 
 
 def _vec_bytes(v):
@@ -415,7 +523,7 @@ def add_observation(db, kind, started_at, ended_at, text, body,
          db.device, db.clock.tick(), time.time()))
     if embed_now and text.strip():
         db.execute("INSERT INTO obs_vec(id,embedding) VALUES(?,?)",
-                   (oid, _vec_bytes(embed([text])[0])))
+                   (oid, _vec_bytes(embed([text], kind='passage')[0])))
     db.commit()
     return oid
 
@@ -524,7 +632,7 @@ def add_belief(db, statement, certainty, sources, author, about=None,
         (bid, statement, float(certainty), float(weight), formed, about, author,
          now, db.device, db.clock.tick(), now))
     db.execute("INSERT INTO bel_vec(id,embedding) VALUES(?,?)",
-               (bid, _vec_bytes(embed([statement])[0])))
+               (bid, _vec_bytes(embed([statement], kind='passage')[0])))
     for oid in sources:
         link(db, 'belief', bid, 'observation', oid, 'came-from')
     if replaces:
@@ -651,6 +759,288 @@ def get_belief(db, bid, reader=None):
     return d
 
 
+# How far a fragment reaches for the context it is missing. Chosen from the
+# store rather than picked: within a session the median gap between
+# observations is 1.23 s, three quarters are under 3.02 s, and then the
+# distribution breaks -- p90 is 10.66 s and p95 is 40.92 s. Speech separated by
+# a second or two is one person continuing; speech separated by half a minute is
+# a different moment. NEIGHBOUR_MAX_GAP_S sits in the flat part after the knee,
+# so a window grows through continuous talk and stops at a real break.
+#
+# One either side, measured rather than assumed. Over five questions and fifty
+# candidates: no context kept 9 answers; one either side kept 13 at identical
+# cost, 4.8 s per question; two either side kept 14 but cost 6.8 s and wedged
+# the model on 2 of 50 prompts -- a five-line window reproducibly hangs it where
+# the same window at four lines answers in 0.6 s. The second neighbour buys one
+# answer and pays for it in latency and in a failure mode that withholds.
+#
+# One is also what the case this exists for needs: "Charitable trust and not a
+# public authority under the RTI Act" has its subject exactly one observation
+# back, 0.42 s earlier.
+NEIGHBOURS_BEFORE = 1
+NEIGHBOURS_AFTER = 1
+NEIGHBOUR_MAX_GAP_S = 8.0
+NEIGHBOUR_MAX_WORDS = 120
+# Below this a neighbour is not context but the same sentence: p75 of the gap
+# distribution, the point up to which speech is still one continuous run. Used
+# when deciding what to release, not what to judge. See gate.
+NEIGHBOUR_TIGHT_GAP_S = 3.0
+
+
+# --- the index unit --------------------------------------------------------
+# An observation is the wrong thing to embed. The median one is four words, 59
+# percent are four or fewer and 37 percent are two or fewer, so most of the
+# index was vectors for text that means nothing alone -- "we want." and
+# "chicken." ranked against whole sentences on equal terms. No amount of
+# judging downstream repairs an index built on fragments.
+#
+# So the thing embedded is a window: a short run of consecutive speech. The
+# thing stored, released and pointed at stays the observation. A window is only
+# how an observation is found.
+#
+# BOUNDS, from the same gap distribution the reach cap came from. Within a
+# session the median gap is 1.23 s, p75 is 3.02 s, then it breaks: p90 10.66 s,
+# p95 40.92 s. WINDOW_MAX_GAP_S sits after that knee, so a window grows through
+# continuous talk and stops at a real pause rather than welding two moments
+# together. WINDOW_TARGET_WORDS is where growth stops being useful: sentence
+# embedding models of this size are built for a sentence or two, and a window
+# that keeps growing starts describing a passage instead of a remark.
+# WINDOW_MAX_OBS is the backstop for a run of one-word utterances, where the
+# word target alone would swallow a whole minute of "okay. okay. right."
+WINDOW_MAX_GAP_S = 8.0
+WINDOW_TARGET_WORDS = 30
+WINDOW_MAX_OBS = 7
+WINDOW_JOIN = " "
+# Windows overlap, so the top-k windows can centre on fewer than k distinct
+# observations. Ask the index for more and keep the best per centre.
+WINDOW_OVERSAMPLE = 3
+# How much of the score is context and how much is the fragment itself.
+# Swept over the seven evaluation questions; see the report.
+WINDOW_WEIGHT = 0.75
+
+
+# An observation that is itself a question is rarely the answer to one. 17.5
+# percent of the speech here is question-shaped by one of the two signals
+# already stored -- 13.0 percent by the transcriber's punctuation, 6.5 percent
+# by the pitch-rise detection, agreeing on only 2.1 -- so this fires often
+# enough to matter.
+#
+# A penalty and never a filter. "Did you take the bins out" is a perfectly good
+# answer to "what did she ask me to do", and a filter would make that
+# unanswerable. This only moves such an observation down the ranking, and only
+# when the query is itself question-shaped; against a query that is not a
+# question it does nothing at all.
+QUESTION_PENALTY = 0.15
+
+
+def looks_like_a_question(text):
+    """Is this text question-shaped. Used on the QUERY side only.
+
+    Stored observations do not go through this -- they carry the real signals,
+    the transcriber's punctuation and the measured pitch rise, in is_question.
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if t.endswith("?"):
+        return True
+    first = t.split()[0] if t.split() else ""
+    return first in {"what", "who", "when", "where", "why", "how", "which",
+                     "whose", "did", "does", "do", "is", "are", "was", "were",
+                     "can", "could", "will", "would", "has", "have", "had"}
+
+
+def question_flags(body, text):
+    """Either stored signal, or a question mark the transcriber left."""
+    b = body if isinstance(body, dict) else {}
+    return bool(b.get('question_by_punctuation')
+                or b.get('question_by_pitch_rise')
+                or (text or '').strip().endswith('?'))
+
+
+def backfill_questions(db):
+    """Set is_question from what is already stored in each observation's body."""
+    n = 0
+    for r in db.execute("SELECT id,text,body FROM observations").fetchall():
+        try:
+            b = json.loads(r['body'])
+        except ValueError:
+            b = {}
+        q = 1 if question_flags(b, r['text']) else 0
+        db.execute("UPDATE observations SET is_question=? WHERE id=?", (q, r['id']))
+        n += q
+    db.commit()
+    return n
+
+
+def build_window(db, oid):
+    """The window centred on one observation.
+
+    Centred, and one per observation, so that a hit resolves to exactly one
+    observation with nothing to decide. The alternative -- windows on a stride,
+    each covering several observations -- makes every hit ambiguous about which
+    observation in it actually answered, and resolving that needs another
+    judgement. Overlap is the price: consecutive windows share most of their
+    text, and an observation appears in up to WINDOW_MAX_OBS of them.
+
+    Growth alternates outward so the centre stays near the middle rather than
+    the window running off in whichever direction has shorter utterances.
+    """
+    c = db.execute("SELECT id,session,started_at,ended_at,text FROM observations "
+                   "WHERE id=?", (oid,)).fetchone()
+    if c is None:
+        return None
+    rows = [dict(c)]
+    words = len(c['text'].split())
+    left_open = right_open = True
+    while (left_open or right_open) and words < WINDOW_TARGET_WORDS \
+            and len(rows) < WINDOW_MAX_OBS:
+        for side in (-1, 1):
+            if side < 0 and not left_open:
+                continue
+            if side > 0 and not right_open:
+                continue
+            edge = rows[0] if side < 0 else rows[-1]
+            if side < 0:
+                r = db.execute(
+                    "SELECT id,session,started_at,ended_at,text FROM observations"
+                    " WHERE session=? AND started_at < ? ORDER BY started_at DESC"
+                    " LIMIT 1", (edge['session'], edge['started_at'])).fetchone()
+                gap = (edge['started_at'] - r['ended_at']) if r else None
+            else:
+                r = db.execute(
+                    "SELECT id,session,started_at,ended_at,text FROM observations"
+                    " WHERE session=? AND started_at > ? ORDER BY started_at"
+                    " LIMIT 1", (edge['session'], edge['started_at'])).fetchone()
+                gap = (r['started_at'] - edge['ended_at']) if r else None
+            if r is None or gap is None or gap > WINDOW_MAX_GAP_S:
+                if side < 0:
+                    left_open = False
+                else:
+                    right_open = False
+                continue
+            if len(rows) + 1 > WINDOW_MAX_OBS:
+                left_open = right_open = False
+                break
+            words += len(r['text'].split())
+            if side < 0:
+                rows.insert(0, dict(r))
+            else:
+                rows.append(dict(r))
+            if words >= WINDOW_TARGET_WORDS:
+                break
+    text = WINDOW_JOIN.join(r['text'].strip() for r in rows)
+    return {'id': 'w' + oid, 'centre_id': oid, 'session': c['session'],
+            'first_id': rows[0]['id'], 'last_id': rows[-1]['id'],
+            'n_obs': len(rows), 'n_words': len(text.split()),
+            'started_at': rows[0]['started_at'], 'ended_at': rows[-1]['ended_at'],
+            'text': text, 'recipe': INDEX_RECIPE}
+
+
+def build_windows(db, batch=256, progress=None):
+    """Rebuild every window and its vector. Derived data: safe to drop and redo."""
+    db.execute("DELETE FROM win_vec")
+    db.execute("DELETE FROM windows")
+    db.commit()
+    ids = [r['id'] for r in db.execute(
+        "SELECT id FROM observations ORDER BY session, started_at")]
+    made = 0
+    for i in range(0, len(ids), batch):
+        chunk = [build_window(db, o) for o in ids[i:i + batch]]
+        chunk = [w for w in chunk if w]
+        if not chunk:
+            continue
+        vecs = embed([w['text'] for w in chunk], kind='passage')
+        for w, v in zip(chunk, vecs):
+            db.execute(
+                "INSERT INTO windows(id,centre_id,session,first_id,last_id,"
+                "n_obs,n_words,started_at,ended_at,text,recipe) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (w['id'], w['centre_id'], w['session'], w['first_id'],
+                 w['last_id'], w['n_obs'], w['n_words'], w['started_at'],
+                 w['ended_at'], w['text'], w['recipe']))
+            db.execute("INSERT INTO win_vec(id,embedding) VALUES(?,?)",
+                       (w['id'], _vec_bytes(v)))
+        db.commit()
+        made += len(chunk)
+        if progress:
+            progress(made, len(ids))
+    return {'windows': made, 'observations': len(ids)}
+
+
+def neighbourhood(db, oid, before=NEIGHBOURS_BEFORE, after=NEIGHBOURS_AFTER,
+                  max_gap=NEIGHBOUR_MAX_GAP_S, max_words=NEIGHBOUR_MAX_WORDS):
+    """The observation, plus what was said either side of it in the session.
+
+    Returns rows in time order, each with 'offset' (0 is the target) and 'gap',
+    the silence between it and the row before it. Growth stops at a gap wider
+    than max_gap, at the session edge, or when the window has enough words --
+    a fragment judged inside a wall of text is no longer the thing being judged.
+    """
+    t = db.execute("SELECT id,session,started_at,ended_at,text,kind FROM "
+                   "observations WHERE id=?", (oid,)).fetchone()
+    if t is None:
+        return []
+    out = [dict(t, offset=0, gap=0.0)]
+    words = len(t['text'].split())
+
+    def grow(direction):
+        nonlocal words
+        edge = out[0] if direction < 0 else out[-1]
+        for n in range(1, (before if direction < 0 else after) + 1):
+            if direction < 0:
+                r = db.execute(
+                    "SELECT id,session,started_at,ended_at,text,kind FROM "
+                    "observations WHERE session=? AND started_at < ? "
+                    "ORDER BY started_at DESC LIMIT 1",
+                    (edge['session'], edge['started_at'])).fetchone()
+                gap = (edge['started_at'] - r['ended_at']) if r else None
+            else:
+                r = db.execute(
+                    "SELECT id,session,started_at,ended_at,text,kind FROM "
+                    "observations WHERE session=? AND started_at > ? "
+                    "ORDER BY started_at LIMIT 1",
+                    (edge['session'], edge['started_at'])).fetchone()
+                gap = (r['started_at'] - edge['ended_at']) if r else None
+            if r is None or gap is None or gap > max_gap:
+                return
+            w = len(r['text'].split())
+            if words + w > max_words:
+                return
+            words += w
+            row = dict(r, offset=direction * n, gap=round(float(gap), 3))
+            if direction < 0:
+                out.insert(0, row)
+            else:
+                out.append(row)
+            edge = row
+
+    grow(-1)
+    grow(+1)
+    # Recompute gaps over the finished window. Growing leftwards inserts at the
+    # front, so the target's own gap -- the silence separating it from the
+    # neighbour before it -- was still the 0.0 it was seeded with, and any rule
+    # reading it saw every left neighbour as adjacent.
+    for k, r in enumerate(out):
+        r['gap'] = 0.0 if k == 0 else round(
+            float(r['started_at'] - out[k - 1]['ended_at']), 3)
+    return out
+
+
+def window_text(rows, mark='>>'):
+    """The neighbourhood as one block, with the fragment being judged marked.
+
+    Marked rather than merged: the judge is being asked about one fragment read
+    in context, not about the paragraph. Without the marker it answers for the
+    whole window and every neighbour comes back as an answer.
+    """
+    lines = []
+    for r in rows:
+        lines.append(f"{mark} {r['text']}" if r['offset'] == 0
+                     else f"   {r['text']}")
+    return "\n".join(lines)
+
+
 def search(db, query, limit=10, kinds=('observation', 'belief'),
            include_superseded=False):
     """Retrieval by meaning, over both kinds, ranked into one list.
@@ -659,18 +1049,71 @@ def search(db, query, limit=10, kinds=('observation', 'belief'),
     not return four generations of what it used to think. They are reachable by
     asking for them, and by following any answer's chain.
     """
-    q = _vec_bytes(embed([query])[0])
+    q = _vec_bytes(embed_query(query))
     out = []
     if 'observation' in kinds:
+        # Search windows, answer with observations. A window is how a fragment
+        # is found; the observation is what it is. Overlap means several
+        # windows can centre on observations near each other, so ask for more
+        # than needed and keep the best window per centre -- a centre is never
+        # returned twice, and what comes back is the record, never the window.
+        # Two indexes, combined. The window says how well the surrounding
+        # speech matches; the observation says whether this fragment is itself
+        # what was asked about. A window hit alone promotes every neighbour of a
+        # good match, because their windows all contain it. An observation hit
+        # alone is the fragment problem this was built to fix. Neither is
+        # sufficient and the failure modes are opposite, so the score is a
+        # weighted sum and both terms are computed for every candidate rather
+        # than left missing for whichever index did not surface it.
+        cand = {}
+        k = limit * WINDOW_OVERSAMPLE
         for r in db.execute(
-                "SELECT v.id, v.distance, o.text, o.started_at, o.person, o.kind "
-                "FROM obs_vec v JOIN observations o ON o.id=v.id "
-                "WHERE v.embedding MATCH ? AND k=? ORDER BY v.distance",
-                (q, limit)):
-            out.append({'kind': 'observation', 'id': r['id'],
-                        'distance': r['distance'], 'text': r['text'],
-                        'at': r['started_at'], 'person': r['person'],
-                        'observation_kind': r['kind'], 'score': 1.0 - r['distance']})
+                "SELECT w.centre_id AS id, v.distance FROM win_vec v "
+                "JOIN windows w ON w.id=v.id "
+                "WHERE v.embedding MATCH ? AND k=? ORDER BY v.distance", (q, k)):
+            cand.setdefault(r['id'], {})['win'] = 1.0 - r['distance']
+        for r in db.execute(
+                "SELECT v.id, v.distance FROM obs_vec v "
+                "WHERE v.embedding MATCH ? AND k=? ORDER BY v.distance", (q, k)):
+            cand.setdefault(r['id'], {})['obs'] = 1.0 - r['distance']
+        if cand:
+            qv = np.frombuffer(q, dtype='float32')
+            ids = list(cand)
+            marks = ",".join("?" * len(ids))
+            for table, key in (('obs_vec', 'obs'), ('win_vec', 'win')):
+                need = [i for i in ids if key not in cand[i]]
+                if not need:
+                    continue
+                if key == 'win':
+                    rows = db.execute(
+                        "SELECT w.centre_id AS id, v.embedding FROM win_vec v "
+                        "JOIN windows w ON w.id=v.id WHERE w.centre_id IN (%s)"
+                        % ",".join("?" * len(need)), need)
+                else:
+                    rows = db.execute(
+                        "SELECT id, embedding FROM obs_vec WHERE id IN (%s)"
+                        % ",".join("?" * len(need)), need)
+                for r in rows:
+                    v = np.frombuffer(r['embedding'], dtype='float32')
+                    cand[r['id']][key] = float(qv @ v)
+            asking = QUESTION_PENALTY and looks_like_a_question(query)
+            for r in db.execute(
+                    "SELECT id,text,started_at,person,kind,is_question FROM "
+                    "observations WHERE id IN (%s)" % marks, ids):
+                c = cand[r['id']]
+                w, o = c.get('win', 0.0), c.get('obs', 0.0)
+                base = WINDOW_WEIGHT * w + (1 - WINDOW_WEIGHT) * o
+                penalised = bool(asking and r['is_question'])
+                if penalised:
+                    base *= (1.0 - QUESTION_PENALTY)
+                out.append({'kind': 'observation', 'id': r['id'],
+                            'question_penalised': penalised,
+                            'distance': 1.0 - base,
+                            'text': r['text'], 'at': r['started_at'],
+                            'person': r['person'], 'observation_kind': r['kind'],
+                            'found_via': {'window': round(w, 4),
+                                          'observation': round(o, 4)},
+                            'score': base})
     if 'belief' in kinds:
         for r in db.execute(
                 "SELECT v.id, v.distance, b.statement, b.certainty, b.weight, "
@@ -829,3 +1272,64 @@ def rebuild_check(db, verbose=True):
               f"{report['identical']}")
         print(f"OK: {report['ok']}")
     return report
+
+
+def reindex(db, verbose=True):
+    """Rebuild every vector under the current settings.
+
+    The remedy the StaleVectors refusal names. Windows are derived, so this
+    throws them away and remakes them; observations and beliefs are untouched
+    except for their vectors.
+    """
+    def tick(done, total):
+        if verbose and done % 256 == 0:
+            print(f"  windows {done}/{total}", flush=True)
+    backfill_questions(db)
+    r = build_windows(db, progress=tick)
+    # beliefs keep a vector of their own: a belief is already a whole statement
+    # and has no session position to draw a window from
+    db.execute("DELETE FROM bel_vec")
+    bel = [dict(x) for x in db.execute("SELECT id,statement FROM beliefs")]
+    for i in range(0, len(bel), 256):
+        chunk = bel[i:i + 256]
+        for b, v in zip(chunk, embed([x['statement'] for x in chunk],
+                                     kind='passage')):
+            db.execute("INSERT INTO bel_vec(id,embedding) VALUES(?,?)",
+                       (b['id'], _vec_bytes(v)))
+    # The per-observation index is kept, not discarded. Windows alone rank a
+    # strong match's neighbours as highly as the match: every window containing
+    # "What did you have for breakfast?" scores well, and each resolves to its
+    # own centre, so "Hey, J." and "Mm, mm, mm" arrived at ranks 2 and 4. The
+    # centre has to answer for itself as well as for its surroundings.
+    db.execute("DELETE FROM obs_vec")
+    obs = [dict(x) for x in db.execute("SELECT id,text FROM observations")]
+    for i in range(0, len(obs), 256):
+        chunk = obs[i:i + 256]
+        for o, v in zip(chunk, embed([x['text'] for x in chunk],
+                                     kind='passage')):
+            db.execute("INSERT INTO obs_vec(id,embedding) VALUES(?,?)",
+                       (o['id'], _vec_bytes(v)))
+    db.commit()
+    for k, v in (("schema_version", str(SCHEMA_VERSION)),
+                 ("embed_model", EMBED_MODEL), ("embed_dims", str(EMBED_DIMS)),
+                 ("index_unit", INDEX_UNIT), ("index_recipe", INDEX_RECIPE)):
+        db.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) "
+                   "DO UPDATE SET value=excluded.value", (k, v))
+    db.commit()
+    r['beliefs'] = len(bel)
+    return r
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    if len(_sys.argv) > 1 and _sys.argv[1] == 'reindex':
+        _db = open(check_vectors=False)
+        import time as _t
+        _t0 = _t.perf_counter()
+        _r = reindex(_db)
+        print(f"reindexed {_r['windows']} window(s) over {_r['observations']} "
+              f"observation(s) and {_r['beliefs']} belief(s) in "
+              f"{_t.perf_counter()-_t0:.1f}s under {INDEX_RECIPE}")
+    else:
+        print(__doc__.strip().splitlines()[0])
+        print("usage: memory.py reindex")

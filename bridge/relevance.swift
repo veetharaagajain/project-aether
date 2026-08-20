@@ -44,11 +44,20 @@ import FoundationModels
 func verdictSchema() throws -> GenerationSchema {
     let root = DynamicGenerationSchema(
         name: "Verdict",
-        description: "whether one fragment answers the question",
+        description: "whether the marked fragment answers the question",
         properties: [
             .init(name: "answers",
-                  description: "true only if this fragment states part of the "
-                             + "answer to the question",
+                  description: "true only if the marked line states part of the "
+                             + "answer to the question, reading it in context",
+                  schema: DynamicGenerationSchema(type: Bool.self)),
+            // Asked in the same call rather than a second one. It costs nothing
+            // extra and it is what decides whether the neighbours are released
+            // alongside the fragment or only used to understand it.
+            .init(name: "needsContext",
+                  description: "true if the marked line cannot be understood on "
+                             + "its own -- for example it continues the sentence "
+                             + "above it, or its subject is only named in a "
+                             + "surrounding line",
                   schema: DynamicGenerationSchema(type: Bool.self))
         ])
     return try GenerationSchema(root: root, dependencies: [])
@@ -78,6 +87,7 @@ struct Request: Codable {
 struct Reply: Codable {
     var ok: Bool
     var keep: [Int] = []          // indices into candidates, 0-based
+    var needsContext: [Int] = []  // ...of which these do not stand alone
     var seconds: Double = 0
     var perCall: [Double] = []
     var mode: String = ""
@@ -86,14 +96,26 @@ struct Reply: Codable {
     var unavailable: String? = nil
 }
 
+let PER_CALL_TIMEOUT_S = 12.0
+
 let INSTRUCTIONS = """
 You decide whether a fragment of someone's recorded speech helps answer a \
 question about them.
 
-Answer true only when the fragment states part of the answer. Being about the \
-same topic is not enough: a question about what someone ate is not answered by \
-them discussing food in general, or by them mentioning a meal without saying \
-what it was.
+You are shown a short stretch of transcript. One line is marked with >>. Judge \
+only that line. The unmarked lines are what was said immediately before and \
+after it, and they are there so you can understand the marked line -- they are \
+not what you are judging.
+
+Set answers to true only when the marked line states part of the answer, read \
+in that context. Speech is often split mid-sentence, so a line that continues \
+the sentence above it may well state the answer even though it reads as a \
+fragment on its own. Being about the same topic is still not enough: a question \
+about what someone ate is not answered by them discussing food in general, or \
+by them mentioning a meal without saying what it was.
+
+Set needsContext to true when the marked line cannot be understood alone -- it \
+continues a neighbouring sentence, or its subject is only named nearby.
 
 Answer false when you are unsure. Withholding a fragment loses an answer; \
 releasing one hands over private speech that was not asked for.
@@ -152,27 +174,54 @@ struct Bridge {
         }
     }
 
-    /// One verdict. Independent of every other verdict on purpose.
+    /// One verdict, or nothing if the model stops responding.
+    ///
+    /// Some prompts wedge the on-device model: it returns neither an answer nor
+    /// an error and the call never completes. A five-line window over this
+    /// corpus reproduced it, while the same window at four lines answered in
+    /// 0.6 s. Without a bound, one such prompt blocks the whole judgement and
+    /// therefore the release that waits on it, indefinitely.
+    ///
+    /// A timeout here rather than only in the caller, so one wedged candidate
+    /// costs that candidate and not the batch. It fails the same way every
+    /// other error does: withheld, and reported.
     static func one(_ question: String, _ fragment: String, _ i: Int)
-        async -> (Int, Bool, Double, String?) {
+        async -> (Int, Bool, Bool, Double, String?) {
         let t = Date()
+        return await withTaskGroup(of: (Int, Bool, Bool, Double, String?)?.self) { g in
+            g.addTask { await judgeOne(question, fragment, i, t) }
+            g.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(PER_CALL_TIMEOUT_S * 1e9))
+                return nil
+            }
+            let first = await g.next() ?? nil
+            g.cancelAll()
+            return first ?? (i, false, false, Date().timeIntervalSince(t),
+                             "timed out after \(PER_CALL_TIMEOUT_S)s")
+        }
+    }
+
+    static func judgeOne(_ question: String, _ fragment: String, _ i: Int,
+                         _ t: Date) async -> (Int, Bool, Bool, Double, String?) {
         do {
             // A fresh session per candidate. Reusing one would let each verdict
             // see the ones before it, which turns independent classifications
             // into a conversation that can talk itself into a pattern.
             let s = LanguageModelSession(instructions: INSTRUCTIONS)
             let r = try await s.respond(
-                to: "Question: \(question)\n\nFragment: \(fragment)\n\n"
-                  + "Does this fragment state part of the answer?",
+                to: "Question: \(question)\n\nTranscript:\n\(fragment)\n\n"
+                  + "Does the marked line state part of the answer?",
                 schema: try verdictSchema(),
                 options: GenerationOptions(temperature: 0.0))
             let yes = try r.content.value(Bool.self, forProperty: "answers")
-            return (i, yes, Date().timeIntervalSince(t), nil)
+            let needs = (try? r.content.value(Bool.self,
+                                              forProperty: "needsContext")) ?? false
+            return (i, yes, needs, Date().timeIntervalSince(t), nil)
         } catch {
             // One candidate failing is not the whole judgement failing, but it
             // must never become a release: an unjudged fragment is withheld and
             // the reason is reported.
-            return (i, false, Date().timeIntervalSince(t), "\(error)")
+            return (i, false, false, Date().timeIntervalSince(t), "\(error)")
         }
     }
 
@@ -180,10 +229,11 @@ struct Bridge {
         var out = Reply(ok: true, mode: concurrency > 1 ? "each-parallel" : "each")
         var stamps = [Double](repeating: 0, count: req.candidates.count)
         var keep: [Int] = []
+        var needsCtx: [Int] = []
         var errs: [String] = []
         let t0 = Date()
         var next = 0
-        await withTaskGroup(of: (Int, Bool, Double, String?).self) { group in
+        await withTaskGroup(of: (Int, Bool, Bool, Double, String?).self) { group in
             // A bounded window rather than all at once: the model serialises
             // internally, and queueing fifty requests at it buys nothing while
             // making a single slow one hold up the whole batch.
@@ -192,9 +242,10 @@ struct Bridge {
                 let i = next; next += 1
                 group.addTask { await one(req.question, req.candidates[i], i) }
             }
-            while let (i, yes, dt, err) = await group.next() {
+            while let (i, yes, needs, dt, err) = await group.next() {
                 stamps[i] = dt
                 if yes { keep.append(i) }
+                if needs { needsCtx.append(i) }
                 if let e = err { errs.append("candidate \(i): \(e)") }
                 if next < req.candidates.count {
                     let j = next; next += 1
@@ -203,6 +254,7 @@ struct Bridge {
             }
         }
         out.keep = keep.sorted()
+        out.needsContext = needsCtx.sorted()
         out.perCall = stamps
         out.calls = req.candidates.count
         out.error = errs.isEmpty ? nil : errs.joined(separator: "; ")
@@ -259,7 +311,7 @@ struct Bridge {
             // warm the model once so the first real request does not pay for it
             let s = LanguageModelSession(instructions: INSTRUCTIONS)
             _ = try? await s.respond(
-                to: "Question: x\n\nFragment: y\n\nDoes this fragment state part of the answer?",
+                to: "Question: x\n\nTranscript:\n>> y\n\nDoes the marked line state part of the answer?",
                 schema: try! verdictSchema(),
                 options: GenerationOptions(temperature: 0.0))
             session = s

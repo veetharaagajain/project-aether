@@ -84,7 +84,7 @@ server = MCPServer(
 
 
 @server.tool()
-def search_memory(query: str, limit: int = 10,
+def search_memory(query: str, limit: int = gate.DEFAULT_SEARCH_LIMIT,
                   kinds: list[str] | None = None,
                   include_superseded: bool = False,
                   caller: str = "", secret: str = "") -> list[dict]:
@@ -96,6 +96,12 @@ def search_memory(query: str, limit: int = 10,
 
     kinds may be ["observation"], ["belief"], or both. Superseded beliefs are
     excluded unless asked for.
+
+    limit is how many candidates are considered, not how many come back --
+    every candidate is judged for relevance and most are withheld. The default
+    is tuned so the answer is almost always inside it; raise it when you would
+    rather have recall than speed, since each extra candidate costs about half
+    a second.
     """
     caller, secret = identity(caller, secret)
     return gate.search_memory(db(), caller, secret, query, limit=limit,
@@ -165,9 +171,25 @@ def record_answer(text: str, cites: list[str], model: str | None = None,
                               about=about)
 
 
+def announce():
+    """Say what code this process is holding, and keep saying it is alive.
+
+    Registered before serving so that a server which is already stale at
+    startup -- launched from a checkout that was edited while it booted -- is
+    visible immediately rather than after the first release.
+    """
+    import staleness as st
+    d = db()
+    st.reap(d)
+    st.register(d, 'mcp')
+    st.heartbeat(lambda: mem.open())
+    return st
+
+
 def serve(http=False, host=gate.DEFAULT_HOST, port=gate.DEFAULT_PORT):
     global _TRANSPORT
     _TRANSPORT = 'http' if http else 'stdio'
+    announce()
     if http:
         if host not in gate.LOCAL_ONLY:
             raise SystemExit(

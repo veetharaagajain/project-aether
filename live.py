@@ -781,6 +781,10 @@ def main():
     print(f"models loaded and warmed in {time.perf_counter()-t_warm:.1f}s")
     # said once at the top, and again whenever it changes. The recording state
     # is not something a person should have to go and ask for.
+    import staleness as st
+    st.reap(session.memory())
+    st.register(session.memory(), 'live')
+    st.heartbeat(lambda: __import__('memory').open())
     session.check_capture()
     print(f"[{inc.banner(session.memory())}]")
     ch.publish({'kind': 'session', 'at': time.time(), 'session': session.id,

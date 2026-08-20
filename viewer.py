@@ -119,7 +119,10 @@ def api_state():
     # rounds was about exactly that: a number duplicated is a number that will
     # silently disagree with itself.
     import markers as mk
-    return {'capturing': s['recording'], 'since': s['since'],
+    import staleness as st
+    stale = [p for p in st.living(db) if p['stale']]
+    return {'stale_processes': stale,
+            'capturing': s['recording'], 'since': s['since'],
             'note': s['note'], 'banner': inc.banner(db),
             'levels': mk.LEVEL_THRESHOLDS,
             'mark_min_words': mk.MARK_MIN_WORDS,
@@ -257,6 +260,23 @@ def api_recent():
         return list(_recent)
 
 
+def api_processes():
+    """Every long-lived process, and whether it is running code that no longer
+    exists on disk.
+
+    This is the answer to the failure that produced it: the MCP server ran two
+    hours of stale code and the only record was a log line nobody read. The
+    viewer is where a person looks, so this is what the header reads.
+    """
+    import staleness as st
+    db = _db()
+    st.reap(db)
+    ps = st.living(db)
+    return {'processes': ps,
+            'stale': [p for p in ps if p['stale']],
+            'now': time.time()}
+
+
 def api_approvals():
     """Pending requests, plus whether approval is on and what stands.
 
@@ -354,6 +374,8 @@ class Handler(BaseHTTPRequestHandler):
                 q = self._query()
                 return self._send(200, api_memory(
                     limit=min(int(q.get('limit', 40)), 500), q=q.get('q')))
+            if path == '/api/processes':
+                return self._send(200, api_processes())
             if path == '/api/approvals':
                 return self._send(200, api_approvals())
             if path == '/api/log':
@@ -451,6 +473,11 @@ def main():
     except singleton.AlreadyRunning as e:
         print(f"refusing to start: {e}", file=sys.stderr)
         return 1
+    import staleness as st
+    d = _db()
+    st.reap(d)
+    st.register(d, 'viewer')
+    st.heartbeat(lambda: __import__('memory').open())
     threading.Thread(target=_reader, daemon=True).start()
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
