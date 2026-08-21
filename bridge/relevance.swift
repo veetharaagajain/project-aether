@@ -162,6 +162,170 @@ func firstLine(_ s: String) -> String {
     s.split(separator: "\n").first.map(String.init) ?? s
 }
 
+// --- answering without searching -------------------------------------------
+// A second job for the same model and the same process: given a question and a
+// short stretch of what was recently said, answer it or decline.
+//
+// The schema carries `support` as well as `answer`, and it is not decoration.
+// The instruction to use only the transcript is a request; requiring the model
+// to quote the line it relied on is checkable. recall.py rejects any answer
+// whose support does not actually occur in the text that was supplied, which
+// turns "do not answer from general knowledge" from a hope into a test. A model
+// that answers from what it happens to know cannot produce a supporting line
+// that is in the transcript, because there is not one.
+func recallSchema() throws -> GenerationSchema {
+    let root = DynamicGenerationSchema(
+        name: "Recall",
+        description: "an answer taken only from the supplied transcript",
+        properties: [
+            .init(name: "canAnswer",
+                  description: "true only if the transcript below plainly "
+                             + "contains the answer; false if it is absent, "
+                             + "partial, or you are unsure",
+                  schema: DynamicGenerationSchema(type: Bool.self)),
+            .init(name: "answer",
+                  description: "one short sentence answering the question, "
+                             + "using only what the transcript says; empty if "
+                             + "canAnswer is false",
+                  schema: DynamicGenerationSchema(type: String.self)),
+            .init(name: "support",
+                  description: "the single line from the transcript that the "
+                             + "answer is taken from, copied exactly; empty if "
+                             + "canAnswer is false",
+                  schema: DynamicGenerationSchema(type: String.self))
+        ])
+    return try GenerationSchema(root: root, dependencies: [])
+}
+
+let RECALL_INSTRUCTIONS = """
+You answer a question about someone using ONLY the transcript you are given.
+
+The transcript is what this person said -- sometimes a stretch of recent \
+speech, sometimes lines found in their record. If it plainly contains the \
+answer, give it in ONE SHORT SENTENCE OF YOUR OWN, and separately copy out the \
+single line you took it from.
+
+Answer in your own words. Do not read the line back. "Sausage croissant for \
+breakfast" is the evidence; "You had a sausage croissant" is the answer. The \
+person is listening to this out loud and already said the original, so \
+repeating their own sentence at them tells them nothing.
+
+Address them as "you". Keep it under about fifteen words. Use only facts that \
+are in the transcript -- rephrasing is required, adding is not allowed.
+
+If the transcript does not contain the answer, set canAnswer to false. Do this \
+whenever you are unsure, whenever the transcript only hints at the answer, and \
+whenever the answer would come from anything you know rather than from the \
+lines in front of you. You are not being asked what is true. You are being \
+asked what was said.
+
+Declining is cheap and correct: the question will simply be looked up properly \
+instead. Answering wrongly is not, because nobody downstream can tell your \
+answer from one that was checked.
+"""
+
+struct RecallRequest: Codable {
+    let question: String
+    let transcript: String
+}
+
+struct RecallReply: Codable {
+    var ok: Bool
+    var canAnswer: Bool = false
+    var answer: String = ""
+    var support: String = ""
+    var seconds: Double = 0
+    var error: String? = nil
+    var unavailable: String? = nil
+}
+
+
+// --- was this said to me ----------------------------------------------------
+// An always-listening system that answers everything it hears will answer the
+// television, one side of a phone call, and two people talking to each other.
+// This is the last decision before it speaks, and it is deliberately biased:
+// staying quiet costs an answer, speaking uninvited makes the thing unbearable
+// to live with.
+func addressedSchema() throws -> GenerationSchema {
+    let root = DynamicGenerationSchema(
+        name: "Addressed",
+        description: "whether this was spoken to the assistant",
+        properties: [
+            .init(name: "addressed",
+                  description: "true only if the speaker is plainly asking the "
+                             + "assistant in the room for something",
+                  schema: DynamicGenerationSchema(type: Bool.self)),
+            .init(name: "audience",
+                  description: "who it was said to: assistant, another person, "
+                             + "nobody, or unclear",
+                  schema: DynamicGenerationSchema(
+                      name: "Audience",
+                      anyOf: ["assistant", "another person", "nobody", "unclear"]))
+        ])
+    return try GenerationSchema(root: root, dependencies: [])
+}
+
+let ADDRESSED_INSTRUCTIONS = """
+You decide whether someone was speaking TO an assistant, or merely speaking \
+near one.
+
+The assistant is always listening in a room. Most of what it hears is not for \
+it: people talking to each other, one side of a phone call, a television, \
+someone reading aloud, someone thinking out loud. A question is not enough -- \
+people ask each other questions all day.
+
+What the assistant is for: it listens all day and remembers what this person \
+said and heard. Everything it can answer comes from that record. So a question \
+FOR it is almost always a question about the past -- what was said, what was \
+decided, what someone mentioned earlier -- or an instruction to look something \
+up in it.
+
+Questions about the LISTENER'S own wishes, feelings, plans or actions are \
+between people. "Do you want a bottle of water", "what do you mean by that", \
+"why did you stop", "what do you want to do" all sound like they address \
+whoever is listening, and in a room full of people they nearly always address a \
+person. The assistant has no wishes and did not do anything, so it is not being \
+asked.
+
+Questions about the SPEAKER'S OWN past are the opposite, and this distinction \
+matters more than any other here. "What did I say about the fund earlier", \
+"what did I have for breakfast", "what was I talking about an hour ago", "what \
+did I decide" are addressed to the assistant almost every time. Nobody asks \
+another person in the room to tell them what they themselves said -- the other \
+person has no better record of it than they do. The assistant does. A question \
+of the form "what did I ..." about something already past is for it.
+
+The pronoun is what decides this, not the tense. "What did I say" is for the \
+assistant; "what did YOU say", "what did you think", "what do you think about \
+that" are asking the listener about themselves and are between people, even \
+though they are also about the past. If the question asks the listener to \
+report on the listener, it is not for the assistant.
+
+Set addressed to true only when the speaker is plainly asking the assistant to \
+recall or look something up. Set it to false for anything else, and for \
+anything you are unsure about. Staying quiet costs one answer, which the person \
+can simply ask for again. Speaking when nobody asked happens out loud, in a \
+room, in front of whoever is there, and cannot be taken back.
+
+You are shown the line, and the few lines before it for context.
+"""
+
+struct AddressedRequest: Codable {
+    let utterance: String
+    var context: String = ""
+    var presence: String = "no evidence"
+}
+
+struct AddressedReply: Codable {
+    var ok: Bool
+    var addressed: Bool = false
+    var audience: String = ""
+    var seconds: Double = 0
+    var error: String? = nil
+    var unavailable: String? = nil
+}
+
+
 @main
 struct Bridge {
     static var session: LanguageModelSession?
@@ -293,6 +457,139 @@ struct Bridge {
         return out
     }
 
+    static func writeRecall(_ r: RecallReply) {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.withoutEscapingSlashes]
+        if let d = try? enc.encode(r) {
+            FileHandle.standardOutput.write(d)
+            FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+        }
+    }
+
+    static func handleRecall(_ body: Data) async {
+        guard let req = try? JSONDecoder().decode(RecallRequest.self, from: body)
+        else { writeRecall(RecallReply(ok: false, error: "bad json")); return }
+        if let why = available() {
+            var r = RecallReply(ok: false)
+            r.unavailable = why
+            r.error = "model unavailable"
+            writeRecall(r)
+            return
+        }
+        let t = Date()
+        // The same timeout discipline the judge uses: a wedged prompt must cost
+        // this question and not the process. Declining on timeout is the safe
+        // direction here too -- it falls through to the search.
+        let out = await withTaskGroup(of: RecallReply?.self) { g -> RecallReply in
+            g.addTask {
+                do {
+                    let s = LanguageModelSession(instructions: RECALL_INSTRUCTIONS)
+                    let r = try await s.respond(
+                        to: "Question: \(req.question)\n\nTranscript:\n"
+                          + "\(req.transcript)\n\nAnswer only from the "
+                          + "transcript above, or decline.",
+                        schema: try recallSchema(),
+                        options: GenerationOptions(temperature: 0.0))
+                    var out = RecallReply(ok: true)
+                    out.canAnswer = (try? r.content.value(
+                        Bool.self, forProperty: "canAnswer")) ?? false
+                    out.answer = (try? r.content.value(
+                        String.self, forProperty: "answer")) ?? ""
+                    out.support = (try? r.content.value(
+                        String.self, forProperty: "support")) ?? ""
+                    return out
+                } catch {
+                    return RecallReply(ok: true, error: "\(error)")
+                }
+            }
+            g.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(PER_CALL_TIMEOUT_S * 1e9))
+                return nil
+            }
+            let first = await g.next() ?? nil
+            g.cancelAll()
+            return first ?? RecallReply(ok: true,
+                                        error: "timed out after \(PER_CALL_TIMEOUT_S)s")
+        }
+        var r = out
+        r.seconds = Date().timeIntervalSince(t)
+        writeRecall(r)
+    }
+
+    static func handleAddressed(_ body: Data) async {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.withoutEscapingSlashes]
+        func out(_ r: AddressedReply) {
+            if let d = try? enc.encode(r) {
+                FileHandle.standardOutput.write(d)
+                FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+            }
+        }
+        guard let req = try? JSONDecoder().decode(AddressedRequest.self, from: body)
+        else { out(AddressedReply(ok: false, error: "bad json")); return }
+        if let why = available() {
+            var r = AddressedReply(ok: false)
+            r.unavailable = why
+            r.error = "model unavailable"
+            out(r)
+            return
+        }
+        let t = Date()
+        // Timing out means staying quiet, which is the safe direction here.
+        let res = await withTaskGroup(of: AddressedReply?.self) { g -> AddressedReply in
+            g.addTask {
+                do {
+                    let s = LanguageModelSession(instructions: ADDRESSED_INSTRUCTIONS)
+                    let ctx = req.context.isEmpty ? ""
+                        : "Just before it:\n\(req.context)\n\n"
+                    // Evidence, not instruction. Alone is not unaccompanied --
+                    // the person may be on a call, or with someone silent, or
+                    // near a television -- so this leans the judgement without
+                    // deciding it.
+                    var who = ""
+                    if req.presence == "alone" {
+                        who = "Only one voice has been heard here recently, so "
+                            + "there may be nobody else present for this to "
+                            + "have been said to. Weigh that, but people also "
+                            + "talk to televisions, to people on calls, and to "
+                            + "themselves, and a garbled fragment is not a "
+                            + "request just because nobody else spoke.\n\n"
+                    } else if req.presence == "accompanied" {
+                        who = "More than one voice has been heard here "
+                            + "recently, so someone else may be present that "
+                            + "this was said to. Weigh that, but a plain "
+                            + "request to the assistant is still a request "
+                            + "even in a room full of people.\n\n"
+                    }
+                    let r = try await s.respond(
+                        to: "\(who)\(ctx)The line to judge:\n\(req.utterance)"
+                          + "\n\nWas this said to the assistant?",
+                        schema: try addressedSchema(),
+                        options: GenerationOptions(temperature: 0.0))
+                    var o = AddressedReply(ok: true)
+                    o.addressed = (try? r.content.value(
+                        Bool.self, forProperty: "addressed")) ?? false
+                    o.audience = (try? r.content.value(
+                        String.self, forProperty: "audience")) ?? ""
+                    return o
+                } catch {
+                    return AddressedReply(ok: true, error: "\(error)")
+                }
+            }
+            g.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(PER_CALL_TIMEOUT_S * 1e9))
+                return nil
+            }
+            let first = await g.next() ?? nil
+            g.cancelAll()
+            return first ?? AddressedReply(ok: true,
+                                           error: "timed out after \(PER_CALL_TIMEOUT_S)s")
+        }
+        var r = res
+        r.seconds = Date().timeIntervalSince(t)
+        out(r)
+    }
+
     static func write(_ r: Reply) {
         let enc = JSONEncoder()
         enc.outputFormatting = [.withoutEscapingSlashes]
@@ -326,6 +623,16 @@ struct Bridge {
                 var r = Reply(ok: available() == nil)
                 r.unavailable = available()
                 write(r)
+                continue
+            }
+            if cmd == "recall", parts.count > 1, let n = Int(parts[1]),
+               let body = input.bytes(n) {
+                await handleRecall(body)
+                continue
+            }
+            if cmd == "addressed", parts.count > 1, let n = Int(parts[1]),
+               let body = input.bytes(n) {
+                await handleAddressed(body)
                 continue
             }
             guard cmd == "judge", parts.count > 1, let n = Int(parts[1]),

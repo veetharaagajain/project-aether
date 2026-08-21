@@ -119,6 +119,57 @@ class SessionState:
         # the next session would be useless, so live_loop rechecks it, but a
         # per-utterance database read is not what this is for.
         self.capturing = True
+        self.silent = deque(maxlen=200)     # what it heard and did not answer
+        self._recent_plain = deque(maxlen=20)
+        self._being_secret = None
+        # the window in which follow-ups still count as addressed, opened by
+        # the name and extended by each answer
+        self.attention = None
+
+    @property
+    def attention(self):
+        if self._attention is None:
+            import addressed as ad
+            self._attention = ad.new_attention()
+        return self._attention
+
+    @attention.setter
+    def attention(self, v):
+        self._attention = v
+
+    def recent_lines(self, n=6):
+        """The last few utterances as plain text, for the addressed check.
+
+        Kept in the session rather than read back from the store, because the
+        question of who someone was talking to is about the conversation, not
+        about what happened to be written down -- and it must still work while
+        capture is paused.
+        """
+        return list(self._recent_plain)[-n:]
+
+    def being_secret(self):
+        """The being's own credential, created on first use.
+
+        It authenticates like any other caller rather than being waved through:
+        the gate's rules are the only thing standing between a question and the
+        store, and a caller that skips them because it happens to live in the
+        same process is a hole with a comment on it.
+        """
+        if self._being_secret is None:
+            import gate as g
+            from pathlib import Path
+            p = Path(__file__).resolve().parent / "store" / "being.secret"
+            db = self.memory()
+            if p.exists() and any(c['caller'] == 'being' for c in g.callers(db)):
+                self._being_secret = p.read_text().strip()
+            else:
+                self._being_secret = g.add_caller(
+                    db, 'being', can_read=True, can_write=False,
+                    note='the being answering out loud in the room')
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(self._being_secret)
+                p.chmod(0o600)
+        return self._being_secret
 
     def memory(self):
         if self._db is None:
@@ -340,6 +391,78 @@ def recognise_segment(audio, rows, session):
     return time.perf_counter() - t, t_fp, res
 
 
+def maybe_answer(session, u, out=sys.stdout):
+    """Decide whether this was said to us, and if so answer it out loud.
+
+    Runs when a segment closes, like everything else. It does not decide when
+    somebody has finished talking -- that is endpointing and a separate problem
+    -- and it does not stop speaking if the person starts, which is
+    interruption and the next piece.
+
+    The answer goes through the gate rather than round it, using the 'being'
+    caller. Nothing about being in the room makes this not a release: the answer
+    is audible to whoever else is present, and routing it through gate means it
+    is refused if the caller cannot read, and appears in the access log and the
+    viewer like every other disclosure.
+    """
+    import addressed as ad
+    import channel as ch
+    try:
+        decision = ad.decide(u, recent_lines=session.recent_lines(),
+                             capturing=session.capturing,
+                             db=session.memory(), attention=session.attention)
+    except ad.NotAddressed as e:
+        session.silent.append({'at': time.time(), 'text': u['plain'],
+                               'rung': e.rung, 'detail': e.detail})
+        ch.publish({'kind': 'addressed', 'at': time.time(), 'spoke': False,
+                    'text': u['plain'], 'rung': e.rung, 'detail': e.detail})
+        return None
+    except Exception as e:                                   # noqa: BLE001
+        # anything unexpected in the deciding layer means silence, not speech
+        print(f"  [addressed check failed, staying quiet: {e}]", file=out)
+        return None
+
+    t = time.perf_counter()
+    try:
+        import gate as g
+        r = g.answer_or_search(session.memory(), 'being', session.being_secret(),
+                               u['plain'], session=session.id)
+    except Exception as e:                                   # noqa: BLE001
+        print(f"  [could not answer: {e}]", file=out)
+        return None
+    spoken = r.get('answer')
+    if not spoken:
+        # Compose from what the search released rather than speaking the
+        # top-ranked fragment. Reading the person's own sentence back at them
+        # answers nothing -- they said it.
+        import recall as rc
+        hits = [h for h in (r.get('released') or []) if h.get('role') == 'answer'] \
+            or (r.get('released') or [])
+        try:
+            spoken = rc.compose_from(u['plain'], [h['text'] for h in hits])['answer']
+        except Exception as e:                               # noqa: BLE001
+            print(f"  [found {len(hits)} fragment(s) but could not compose "
+                  f"an answer, staying quiet: {e}]", file=out)
+            spoken = None
+    if not spoken:
+        print(f"  [addressed, but nothing to say]", file=out)
+        ch.publish({'kind': 'addressed', 'at': time.time(), 'spoke': False,
+                    'text': u['plain'], 'rung': 'nothing to say', 'detail': ''})
+        return None
+
+    import voice
+    voice.say(spoken, db=session.memory())
+    took = time.perf_counter() - t
+    print(f"  [ANSWERED aloud in {decision['seconds']+took:.1f}s] {spoken}", file=out)
+    ch.publish({'kind': 'addressed', 'at': time.time(), 'spoke': True,
+                'text': u['plain'], 'answer': spoken,
+                'rung': decision.get('rung'), 'detail': decision.get('detail'),
+                'presence': decision.get('presence'),
+                'direct': r.get('answered_directly'),
+                'seconds': round(decision['seconds'] + took, 2)})
+    return spoken
+
+
 def store_utterances(session, us, t0, blob):
     """Every utterance of this segment, into the memory store.
 
@@ -410,6 +533,11 @@ def handle_segment(audio, t0, session, gap_before, out=sys.stdout):
 
     if session.capturing:
         store_utterances(session, us, t0, blob)
+
+    # The loop closes here: the thing that heard the question answers it.
+    for u in us:
+        maybe_answer(session, u, out)
+        session._recent_plain.append(u['plain'])
 
     for u in us:
         u['segment'] = session.n_segments

@@ -18,6 +18,13 @@ header{display:flex;align-items:center;gap:16px;padding:10px 14px;
 #stale{display:none;background:#7a1f1f;color:#ffe9e9;padding:9px 14px;
        border-bottom:1px solid #a33;font-weight:600}
 #stale.on{display:block}
+/* What it said out loud, and what it heard and did not answer. */
+#spoken{max-height:220px;overflow-y:auto;border-top:1px solid var(--line);
+        padding:6px 12px;font-size:12px}
+.spk{padding:2px 0;border-bottom:1px solid var(--line)}
+.spk .t{color:var(--dim)}
+.spk.said{color:#cfe8cf}
+.spk.quiet{color:var(--dim)}
 #stale ul{margin:4px 0 0;padding-left:18px;font-weight:400;font-size:12px}
 #stale code{color:#ffd9d9}
 #counts{color:var(--dim)}
@@ -73,6 +80,7 @@ code{color:var(--dim);font-size:11px}
   <div style="flex:1"></div>
   <div class="meta" id="conn"></div>
 </header>
+<div id="spoken"></div>
 <nav>
   <button data-t="live" class="sel">live</button>
   <button data-t="memory">memory</button>
@@ -173,6 +181,23 @@ function setRec(on, banner){
     await fetch(on ? '/api/pause' : '/api/resume', {method:'POST'});
     $('#toggle').disabled = false; state();
   };
+}
+
+function addressed(e){
+  // Every decision about whether it was spoken to, including the ones where it
+  // stayed quiet. A being that answers out loud has to be answerable for it,
+  // and the quiet decisions are the ones that show why it is not answering.
+  const el=$('#spoken'); if(!el) return;
+  const d=document.createElement('div');
+  d.className = 'spk ' + (e.spoke ? 'said' : 'quiet');
+  d.innerHTML = '<span class="t">'+clock(e.at)+'</span> '
+    + (e.spoke
+        ? '<b>SPOKE</b> &ldquo;'+esc(e.answer||'')+'&rdquo; <i>&mdash; heard: '
+          +esc(e.text||'')+'</i>'
+        : 'stayed quiet <i>('+esc(e.rung||'')+(e.detail?': '+esc(e.detail):'')
+          +')</i> &mdash; '+esc((e.text||'').slice(0,60)));
+  el.prepend(d);
+  while(el.children.length>40) el.lastChild.remove();
 }
 
 function showStale(list){

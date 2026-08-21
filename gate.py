@@ -493,6 +493,53 @@ def search_memory(db, caller, secret, query, limit=DEFAULT_SEARCH_LIMIT, kinds=N
     return hits
 
 
+def answer_or_search(db, caller, secret, query, limit=DEFAULT_SEARCH_LIMIT,
+                     session=None, allow_direct=True, **kw):
+    """Answer from what is already known, or fall through to the store.
+
+    IS A DIRECT ANSWER A RELEASE. I think yes, in substance, and I have built it
+    that way rather than deciding quietly. Nothing is handed over row by row and
+    no observation leaves, but "he had a sausage croissant" carries the same
+    content to the same caller as releasing the utterance would. Treating that
+    as free because it took a different code path would make the gate a
+    formality that any caller can walk around by phrasing a question well.
+
+    So a direct answer needs the same can_read the search needs, is written to
+    the access log with the ids it was drawn from, and is refused for a caller
+    that may not read. What it does NOT currently do is go to manual approval,
+    and that is the part I am unsure about and want looked at: the person
+    approving a release sees the speech that would leave, and here there is no
+    speech to show -- only a sentence derived from it. Showing the sentence is
+    probably right and showing the source lines probably defeats the point of
+    not releasing them.
+
+    What is certainly true is that this releases less. One sentence drawn from
+    speech the caller could otherwise have received in full is a narrower
+    disclosure than five judged candidates, even if it is not zero.
+    """
+    args = {'query': query, 'limit': limit, 'direct': True}
+    why = admit(db, caller, secret, 'search_memory', args)
+    if allow_direct:
+        import recall as rc
+        try:
+            got = rc.try_answer(db, query, session=session)
+        except (rc.NotAnswerable, Exception) as e:      # noqa: BLE001
+            if isinstance(e, rc.NotAnswerable):
+                reason = str(e)
+            else:
+                reason = f"recall unavailable: {e}"
+            log(db, caller, 'answer_direct', args, 'fell through', reason)
+        else:
+            log(db, caller, 'answer_direct', args, 'allowed',
+                f"{why}; answered from {got['source_kind']} without searching "
+                f"in {got['seconds']}s", got['source_ids'])
+            return {'answered_directly': True, 'answer': got['answer'],
+                    'from': got['source_kind'], 'source_ids': got['source_ids'],
+                    'seconds': got['seconds'], 'released': []}
+    hits = search_memory(db, caller, secret, query, limit=limit, **kw)
+    return {'answered_directly': False, 'answer': None, 'released': hits}
+
+
 def fetch_observation(db, caller, secret, id, with_body=True):
     args = {'id': id, 'with_body': with_body}
     why = admit(db, caller, secret, 'fetch_observation', args)

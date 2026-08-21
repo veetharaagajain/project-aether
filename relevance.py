@@ -141,6 +141,43 @@ def shutdown():
     _PROC = None
 
 
+def request(header, payload, budget):
+    """One request/response on the shared bridge. Used by judge and by recall.
+
+    Exposed so recall.py runs in the same process as the judge: the model takes
+    seconds to load and there is no reason to pay that twice, and two processes
+    holding the same on-device model is a way to discover its concurrency
+    limits by accident.
+    """
+    with _LOCK:
+        try:
+            p = daemon()
+        except Unavailable:
+            raise
+        except Exception as e:                   # noqa: BLE001
+            raise Unavailable(f"the relevance bridge is not usable: {e}") from e
+        if _UNAVAILABLE:
+            raise Unavailable(_UNAVAILABLE)
+        try:
+            p.stdin.write(header.encode())
+            p.stdin.write(payload)
+            p.stdin.flush()
+            ready, _, _ = select.select([p.stdout], [], [], budget)
+            if not ready:
+                shutdown()
+                raise Unavailable(
+                    f"the bridge did not answer within {budget:.0f}s; it was "
+                    f"restarted and nothing was returned")
+            line = p.stdout.readline()
+        except (BrokenPipeError, OSError) as e:
+            shutdown()
+            raise Unavailable(f"the relevance bridge died: {e}") from e
+    if not line:
+        shutdown()
+        raise Unavailable("the relevance bridge closed the connection")
+    return json.loads(line)
+
+
 def judge(question, candidates, mode=DEFAULT_MODE, concurrency=4):
     """Which candidates answer the question. Returns (keep_indices, meta).
 
