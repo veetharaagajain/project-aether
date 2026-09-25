@@ -120,13 +120,118 @@ def daemon():
             return _PROC
 
 
-def available():
-    """Whether the model is there, without judging anything."""
+# --- health --------------------------------------------------------------
+# What available() used to be: "did the helper process start and print ready".
+# That is a check on the wrapper, not on the thing. When Apple's on-device
+# model went wrong at the OS level -- SensitiveContentAnalysisML error 15,
+# ModelManagerError 1013 -- the bridge stayed up, kept answering, and failed
+# every single call, while available() went on saying yes. In the router that
+# is worse than a plain outage: a provider that lies about being available is
+# first in order for classify, extract and compose, so nothing ever falls
+# through to something that works.
+#
+# So health is decided by what actually happened, not by what is running.
+# Every reply passes through note_outcome, and real traffic keeps the verdict
+# fresh for free. A probe -- one real, tiny generation -- runs only when there
+# is no recent evidence, which in normal use is never.
+HEALTH_TTL_S = 60.0          # how long an observed outcome speaks for
+FAILURES_TO_UNHEALTHY = 2    # consecutive, so one blip does not flap the router
+PROBE_BUDGET_S = 12.0
+
+# Errors that mean the model could not work, as opposed to the model working
+# and saying no. The second is a normal outcome and must not mark anything
+# unhealthy: "canAnswer false" is the on-device model doing its job.
+INFRA_MARKERS = ('foundationmodels', 'modelmanager', 'sensitivecontent',
+                 'languagemodelerror', 'bad json', 'timed out', 'unavailable',
+                 'the bridge', 'inference')
+
+_HEALTH = {'ok': None, 'why': 'never checked', 'at': 0.0, 'fails': 0,
+           'probes': 0, 'probe_s': 0.0, 'observed': 0}
+
+
+def health():
+    """What is known about the model right now, for a header or the viewer."""
+    return dict(_HEALTH)
+
+
+def _infra_failure(reply):
+    if not isinstance(reply, dict):
+        return False
+    if reply.get('unavailable'):
+        return True
+    err = str(reply.get('error') or '').lower()
+    if err and any(m in err for m in INFRA_MARKERS):
+        return True
+    # ok is the bridge's own verdict on whether it could do the work at all
+    return reply.get('ok') is False
+
+
+def note_outcome(reply=None, failed_because=None):
+    """Record what a real call did. This is the cheap half of the health check
+    and the reason a probe almost never runs."""
+    _HEALTH['observed'] += 1
+    _HEALTH['at'] = time.time()
+    if failed_because is not None or _infra_failure(reply):
+        _HEALTH['fails'] += 1
+        why = failed_because or str((reply or {}).get('error'))[:160]
+        if _HEALTH['fails'] >= FAILURES_TO_UNHEALTHY:
+            _HEALTH.update(ok=False, why=f'{_HEALTH["fails"]} calls in a row '
+                                         f'failed: {why}')
+        return
+    _HEALTH.update(ok=True, why='a call succeeded', fails=0)
+
+
+def probe():
+    """One real generation, to find out rather than to assume.
+
+    Deliberately the smallest thing the model can be asked that still exercises
+    the whole path: the bridge, FoundationModels, guided generation, and the
+    reply parse. A ready flag would exercise none of it, which is how this
+    went wrong in the first place.
+    """
+    t0 = time.perf_counter()
+    _HEALTH['probes'] += 1
+    body = json.dumps({'utterance': 'hello', 'context': '',
+                       'presence': ''}).encode()
+    try:
+        r = request(f"addressed {len(body)}\n", body, PROBE_BUDGET_S,
+                    _note=False)
+    except Unavailable as e:
+        _HEALTH['probe_s'] += time.perf_counter() - t0
+        _HEALTH.update(ok=False, why=f'probe failed: {e}', at=time.time())
+        return False, _HEALTH['why']
+    took = time.perf_counter() - t0
+    _HEALTH['probe_s'] += took
+    if _infra_failure(r):
+        _HEALTH.update(ok=False, at=time.time(),
+                       why=f'probe failed: {str(r.get("error"))[:160]}')
+        return False, _HEALTH['why']
+    _HEALTH.update(ok=True, why=f'probe answered in {took:.1f}s', at=time.time(),
+                   fails=0)
+    return True, _HEALTH['why']
+
+
+def available(allow_probe=True):
+    """Whether the model can actually do work.
+
+    Three answers, cheapest first. If the bridge will not start, no. If a real
+    call succeeded or failed recently, that is the answer and it costs nothing.
+    Only with no recent evidence does this pay for a probe.
+    """
     try:
         daemon()
     except Exception as e:                       # noqa: BLE001
+        _HEALTH.update(ok=False, why=str(e), at=time.time())
         return False, str(e)
-    return (_UNAVAILABLE is None), _UNAVAILABLE
+    if _UNAVAILABLE:
+        _HEALTH.update(ok=False, why=_UNAVAILABLE, at=time.time())
+        return False, _UNAVAILABLE
+    fresh = (time.time() - _HEALTH['at']) < HEALTH_TTL_S
+    if fresh and _HEALTH['ok'] is not None:
+        return _HEALTH['ok'], _HEALTH['why']
+    if not allow_probe:
+        return True, 'not checked (probing disabled)'
+    return probe()
 
 
 def shutdown():
@@ -141,7 +246,7 @@ def shutdown():
     _PROC = None
 
 
-def request(header, payload, budget):
+def request(header, payload, budget, _note=True):
     """One request/response on the shared bridge. Used by judge and by recall.
 
     Exposed so recall.py runs in the same process as the judge: the model takes
@@ -165,17 +270,26 @@ def request(header, payload, budget):
             ready, _, _ = select.select([p.stdout], [], [], budget)
             if not ready:
                 shutdown()
+                if _note:
+                    note_outcome(failed_because=f'timed out after {budget:.0f}s')
                 raise Unavailable(
                     f"the bridge did not answer within {budget:.0f}s; it was "
                     f"restarted and nothing was returned")
             line = p.stdout.readline()
         except (BrokenPipeError, OSError) as e:
             shutdown()
+            if _note:
+                note_outcome(failed_because=f'the bridge died: {e}')
             raise Unavailable(f"the relevance bridge died: {e}") from e
     if not line:
         shutdown()
+        if _note:
+            note_outcome(failed_because='the bridge closed the connection')
         raise Unavailable("the relevance bridge closed the connection")
-    return json.loads(line)
+    reply = json.loads(line)
+    if _note:
+        note_outcome(reply)
+    return reply
 
 
 def judge(question, candidates, mode=DEFAULT_MODE, concurrency=4):
@@ -187,43 +301,17 @@ def judge(question, candidates, mode=DEFAULT_MODE, concurrency=4):
     """
     if not candidates:
         return [], {'calls': 0, 'seconds': 0.0, 'mode': mode}
-    payload = json.dumps({'question': question,
-                          'candidates': list(candidates),
-                          'mode': mode,
-                          'concurrency': concurrency}).encode()
-    with _LOCK:
-        try:
-            p = daemon()
-        except Unavailable:
-            raise
-        except Exception as e:                   # noqa: BLE001
-            raise Unavailable(f"the relevance bridge is not usable: {e}") from e
-        if _UNAVAILABLE:
-            raise Unavailable(_UNAVAILABLE)
-        try:
-            p.stdin.write(f"judge {len(payload)}\n".encode())
-            p.stdin.write(payload)
-            p.stdin.flush()
-            # A deadline, not a blocking read. The bridge bounds each candidate
-            # itself, so this is the backstop for the bridge as a whole going
-            # away or wedging below that level; without it a stuck model blocks
-            # the release waiting on it forever, which is how this was found.
-            budget = REPLY_BASE_S + REPLY_PER_CANDIDATE_S * len(candidates)
-            ready, _, _ = select.select([p.stdout], [], [], budget)
-            if not ready:
-                shutdown()
-                raise Unavailable(
-                    f"the relevance judge did not answer within {budget:.0f}s "
-                    f"for {len(candidates)} candidate(s); the bridge was "
-                    f"restarted and nothing was released")
-            line = p.stdout.readline()
-        except (BrokenPipeError, OSError) as e:
-            shutdown()
-            raise Unavailable(f"the relevance bridge died: {e}") from e
-    if not line:
-        shutdown()
-        raise Unavailable("the relevance bridge closed the connection")
-    r = json.loads(line)
+    payload = {'question': question, 'candidates': list(candidates),
+               'mode': mode, 'concurrency': concurrency}
+    # Through the capability boundary, not straight at the bridge. This asks
+    # for a classification and does not care who provides it; capability.py is
+    # the only file that knows the answer is currently Apple's on-device model.
+    import capability as cap
+    budget = REPLY_BASE_S + REPLY_PER_CANDIDATE_S * len(candidates)
+    try:
+        r, via = cap.ask('judge_relevance', payload, budget=budget)
+    except cap.NoProvider as e:
+        raise Unavailable(str(e)) from e
     if r.get('unavailable'):
         raise Unavailable(r['unavailable'])
     if not r.get('ok') and not r.get('keep'):

@@ -382,6 +382,25 @@ class Store(sqlite3.Connection):
     device = None
     clock = None
 
+    def execute(self, *a, **kw):
+        """Every statement, retried while the database is locked.
+
+        The retry started life wrapped around add_observation, which fixed the
+        write that was crashing and left every other one exposed -- and the
+        crash simply moved to the start-up writes in staleness.register, which
+        run before anything else and are exactly when a second process is most
+        likely to be starting too.
+
+        So it lives on the connection instead of on one caller. A statement
+        that returns SQLITE_BUSY did not take effect, so re-running that
+        statement is safe; the case this does not cover is BUSY raised by
+        commit, which is why commit retries as well.
+        """
+        return write_retry(lambda: sqlite3.Connection.execute(self, *a, **kw))
+
+    def commit(self):
+        return write_retry(lambda: sqlite3.Connection.commit(self))
+
 
 def _device_id(db):
     row = db.execute("SELECT value FROM meta WHERE key='device'").fetchone()
@@ -392,14 +411,70 @@ def _device_id(db):
     return d
 
 
+# How long a write waits for another connection to finish before giving up.
+# Ten seconds is far longer than any write here takes and far shorter than a
+# person would wait for the store to be wedged.
+BUSY_TIMEOUT_MS = 10000
+WRITE_ATTEMPTS = 4
+WRITE_BACKOFF_S = 0.25
+
+
+class Busy(Exception):
+    """The store stayed locked through every retry. Raised rather than
+    returned so a caller cannot mistake a dropped write for a stored one."""
+
+
+def write_retry(fn, attempts=WRITE_ATTEMPTS, backoff=WRITE_BACKOFF_S):
+    """Run a write, retrying while the database is locked.
+
+    busy_timeout handles contention inside SQLite and this handles what is
+    left: a lock held longer than the timeout, or one taken between the
+    timeout expiring and the retry. Backoff is exponential and jittered,
+    because two processes retrying in lockstep is how a brief collision
+    becomes a long one.
+    """
+    import random
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if 'locked' not in str(e).lower() and 'busy' not in str(e).lower():
+                raise
+            last = e
+            if i < attempts - 1:
+                time.sleep(backoff * (2 ** i) * (0.5 + random.random()))
+    raise Busy(f"the store stayed locked through {attempts} attempts: {last}")
+
+
 def open(path=None, check_vectors=True):
     """The store, created if absent, with sqlite-vec loaded."""
     import sqlite_vec
     p = Path(path or DB_PATH)
     p.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(p), factory=Store)
+    # Shared across threads deliberately. The live path now runs its pipeline
+    # on a worker thread so a slow segment cannot stall audio capture, which
+    # means the connection built on the main thread is used from that worker
+    # -- and sqlite3 refuses that by default, with "SQLite objects created in a
+    # thread can only be used in that same thread". It is safe here because
+    # this SQLite is built serialized (sqlite3.threadsafety == 3), so the
+    # library takes its own mutex around every use; the check being disabled is
+    # Python's, not SQLite's.
+    if sqlite3.threadsafety < 3:
+        raise RuntimeError(
+            "this sqlite3 is not serialized, so the store cannot be shared "
+            "across threads; the live path needs a connection per thread")
+    db = sqlite3.connect(str(p), factory=Store, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
+    # SQLite's default busy timeout is zero: a database held by another
+    # connection raises SQLITE_BUSY on the instant rather than waiting. That is
+    # what took the live service down -- a second process had the store open,
+    # add_observation raised, nothing caught it, and launchd restarted a
+    # capture that had been running fine. WAL already lets readers and one
+    # writer coexist; this covers the case of two writers, which is brief
+    # because every write here is a single small insert.
+    db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     db.execute("PRAGMA foreign_keys=ON")
     db.enable_load_extension(True)
     sqlite_vec.load(db)
@@ -420,8 +495,11 @@ def open(path=None, check_vectors=True):
     # every existing caller with NULL, which authenticate() treats as
     # unusable -- the failure mode asked for.
     have = {r[1] for r in db.execute("PRAGMA table_info(callers)")}
+    # can_outward defaults to 0, so an existing caller gains no new reach from
+    # the column appearing -- the failure mode asked for, again.
     for col, decl in (('secret_salt', 'BLOB'), ('secret_hash', 'BLOB'),
-                      ('secret_set_at', 'REAL')):
+                      ('secret_set_at', 'REAL'),
+                      ('can_outward', 'INTEGER NOT NULL DEFAULT 0')):
         if col not in have:
             db.execute(f"ALTER TABLE callers ADD COLUMN {col} {decl}")
 
@@ -512,19 +590,40 @@ def add_observation(db, kind, started_at, ended_at, text, body,
     """Record something that happened. There is no update counterpart."""
     oid = ulid(started_at * 1000)
     a = audio or {}
-    db.execute(
-        "INSERT INTO observations(id,kind,started_at,ended_at,session,person_id,"
-        "person,person_decision,speaker,text,body,audio_blob,audio_offset,"
-        "audio_seconds,config_digest,device,hlc,written_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (oid, kind, started_at, ended_at, session, person_id, person,
-         person_decision, speaker, text, json.dumps(body, separators=(',', ':')),
-         a.get('blob'), a.get('offset'), a.get('seconds'), config_digest,
-         db.device, db.clock.tick(), time.time()))
-    if embed_now and text.strip():
-        db.execute("INSERT INTO obs_vec(id,embedding) VALUES(?,?)",
-                   (oid, _vec_bytes(embed([text], kind='passage')[0])))
-    db.commit()
+
+    def write():
+        db.execute(
+            # is_question is set HERE, at insert. It used to be set only by
+            # backfill_questions, which meant every observation written since
+            # the column was added carried the default 0 -- 1,903 rows ending
+            # in a question mark with the flag clear -- so the question penalty
+            # in search() could never fire on any of them. The penalty was not
+            # too small, it had nothing to act on.
+            "INSERT INTO observations(id,kind,started_at,ended_at,session,"
+            "person_id,person,person_decision,speaker,text,body,audio_blob,"
+            "audio_offset,audio_seconds,config_digest,device,hlc,written_at,"
+            "is_question) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (oid, kind, started_at, ended_at, session, person_id, person,
+             person_decision, speaker, text,
+             json.dumps(body, separators=(',', ':')),
+             a.get('blob'), a.get('offset'), a.get('seconds'), config_digest,
+             db.device, db.clock.tick(), time.time(),
+             1 if question_flags(body, text) else 0))
+        if embed_now and text.strip():
+            db.execute("INSERT INTO obs_vec(id,embedding) VALUES(?,?)",
+                       (oid, _vec_bytes(embed([text], kind='passage')[0])))
+        db.commit()
+
+    try:
+        write_retry(write)
+    except Busy:
+        # a half-applied insert would leave the row without its vector
+        try:
+            db.rollback()
+        except sqlite3.Error:
+            pass
+        raise
     return oid
 
 
@@ -808,8 +907,25 @@ NEIGHBOUR_TIGHT_GAP_S = 3.0
 # WINDOW_MAX_OBS is the backstop for a run of one-word utterances, where the
 # word target alone would swallow a whole minute of "okay. okay. right."
 WINDOW_MAX_GAP_S = 8.0
-WINDOW_TARGET_WORDS = 30
-WINDOW_MAX_OBS = 7
+# Set from the LoCoMo window sweep, transferred rather than copied. There the
+# optimum was three complete conversational contributions: one alone scored
+# 22% recall, three scored 41%, seven scored 33% and nine scored 30%. Both
+# tails hurt -- too narrow is a fragment, too wide matches on anything it
+# contains and stops discriminating.
+#
+# A LoCoMo turn is 20 words and one complete thought. Here an observation is
+# one run between silences, median four words, 60 percent of them four or
+# fewer, so a complete thought spans several observations rather than one.
+# Three thoughts is therefore roughly 40 words, not the 60 that won on LoCoMo
+# and not the 30 that was here; and the observation cap has to rise with it or
+# the word target is never reached. The measured window before this was 27
+# words over 6 observations, so this widens it by about half a thought.
+#
+# NOT validated on this store: that would need labelled questions against real
+# speech, which do not exist. It is an inference from the shape of the LoCoMo
+# curve, and it is one constant to put back.
+WINDOW_TARGET_WORDS = 40
+WINDOW_MAX_OBS = 9
 WINDOW_JOIN = " "
 # Windows overlap, so the top-k windows can centre on fewer than k distinct
 # observations. Ask the index for more and keep the best per centre.
@@ -966,6 +1082,63 @@ def build_windows(db, batch=256, progress=None):
         if progress:
             progress(made, len(ids))
     return {'windows': made, 'observations': len(ids)}
+
+
+def repair_windows(db, gone_ids):
+    """Bring the window index back in line after observations were deleted.
+
+    Windows are derived, but they are not merely a pointer: each one stores the
+    joined text of its span. Deleting an observation and leaving the windows
+    alone removes the row and keeps the words, in up to WINDOW_MAX_OBS windows
+    that are all still searchable -- so a forgotten sentence stays findable by
+    the one index built to find sentences by their surroundings. That is the
+    whole leak, and it is silent, because the observation really is gone.
+
+    A window is affected when a deleted observation lay inside its span. Those
+    windows are dropped and rebuilt around whatever survives; build_window
+    reads live rows, so rebuilding after the delete is enough. Windows centred
+    on a deleted observation are dropped and not rebuilt -- their centre no
+    longer exists.
+    """
+    if not gone_ids:
+        return {'dropped': 0, 'rebuilt': 0}
+    # the spans to repair, found from the deleted rows' own tombstoned times.
+    # Passed in rather than looked up: by the time this runs the rows are gone.
+    spans = [(g['session'], g['started_at']) for g in gone_ids
+             if g.get('session') is not None]
+    doomed = {g['id'] for g in gone_ids}
+    affected = {}
+    for session, at in spans:
+        for r in db.execute(
+                "SELECT id,centre_id FROM windows WHERE session=? AND "
+                "started_at <= ? AND ended_at >= ?", (session, at, at)):
+            affected[r['id']] = r['centre_id']
+    if not affected:
+        return {'dropped': 0, 'rebuilt': 0}
+    q = ",".join("?" * len(affected))
+    db.execute(f"DELETE FROM win_vec WHERE id IN ({q})", list(affected))
+    db.execute(f"DELETE FROM windows WHERE id IN ({q})", list(affected))
+    centres = [c for c in affected.values() if c not in doomed]
+    rebuilt = 0
+    for i in range(0, len(centres), 256):
+        chunk = [build_window(db, o) for o in centres[i:i + 256]]
+        chunk = [w for w in chunk if w]
+        if not chunk:
+            continue
+        vecs = embed([w['text'] for w in chunk], kind='passage')
+        for w, v in zip(chunk, vecs):
+            db.execute(
+                "INSERT INTO windows(id,centre_id,session,first_id,last_id,"
+                "n_obs,n_words,started_at,ended_at,text,recipe) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (w['id'], w['centre_id'], w['session'], w['first_id'],
+                 w['last_id'], w['n_obs'], w['n_words'], w['started_at'],
+                 w['ended_at'], w['text'], w['recipe']))
+            db.execute("INSERT INTO win_vec(id,embedding) VALUES(?,?)",
+                       (w['id'], _vec_bytes(v)))
+        rebuilt += len(chunk)
+    db.commit()
+    return {'dropped': len(affected), 'rebuilt': rebuilt}
 
 
 def neighbourhood(db, oid, before=NEIGHBOURS_BEFORE, after=NEIGHBOURS_AFTER,

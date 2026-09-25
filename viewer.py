@@ -471,8 +471,10 @@ def main():
             "first, which then shows nothing and does not say why.",
             process='viewer.py')
     except singleton.AlreadyRunning as e:
+        # 4, not 1, so the supervisor can tell "someone else has it" from a
+        # real failure and back off instead of restarting into the same wall.
         print(f"refusing to start: {e}", file=sys.stderr)
-        return 1
+        return 4
     import staleness as st
     d = _db()
     st.reap(d)

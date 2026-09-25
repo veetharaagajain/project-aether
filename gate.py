@@ -482,15 +482,132 @@ def search_memory(db, caller, secret, query, limit=DEFAULT_SEARCH_LIMIT, kinds=N
         log(db, caller, 'search_memory', args, 'denied', f"judge unavailable: {e}")
         raise Denied(str(e))
     args['narrowed'] = f"{note.get('kept', considered)} of {considered}"
+
+    # A fragment cannot be composed from, so a line too short to stand alone is
+    # released as its window instead. That is MORE speech than the question
+    # matched, which is exactly what this gate exists to control, so it is done
+    # here rather than quietly in the caller: the expansion happens before
+    # approval, the approval text marks the matched line with >> and shows the
+    # neighbours that come with it, and the count goes in the log.
+    import recall as rc
+    hits = rc.expand_short(db, hits)
+    grown = [h for h in hits if h.get('released') == 'window']
+    args['expanded'] = f"{len(grown)} of {len(hits)}"
+    args['extra_observations'] = sum(h.get('n_released', 1) - 1 for h in grown)
+
+    def shown(h):
+        if h.get('released') == 'window':
+            return (f"[{h['kind']}, matched one line, releasing "
+                    f"{h.get('n_released')} either side]\n"
+                    + h.get('window_text', h['text']))
+        return f"[{h['kind']}] {h['text']}"
+
     ok, why2 = release(db, caller, 'search_memory', args, hits,
-                       [f"[{h['kind']}] {h['text']}" for h in hits])
+                       [shown(h) for h in hits])
     if not ok:
         log(db, caller, 'search_memory', args, 'denied', why2)
         raise Denied(why2)
     log(db, caller, 'search_memory', args, 'allowed',
         f"{why}; {why2}; narrowed {note.get('kept', considered)}/{considered}"
+        + (f"; {len(grown)} fragment(s) released as their window, "
+           f"{args['extra_observations']} extra observation(s)" if grown else "")
         + (f" in {note['seconds']}s" if note.get('seconds') else ""), hits)
     return hits
+
+
+# Sending a question to a model that is not on this machine is a release, and
+# not a lesser one for being the being that does it. The text leaving is the
+# person's question, which carries their words and their subject, and often the
+# fragments behind it too.
+#
+# So it is off unless turned on, and turning it on is a separate act from
+# letting a caller read. can_read says what may be handed to a caller here;
+# this says what may leave the machine entirely, and the two are not the same
+# permission wearing different hats.
+OUTWARD_MODES = ('off', 'ask', 'allow')
+DEFAULT_OUTWARD = 'off'
+
+
+def outward_policy(db):
+    r = db.execute("SELECT value FROM meta WHERE key='outward_policy'").fetchone()
+    v = r[0] if r else DEFAULT_OUTWARD
+    return v if v in OUTWARD_MODES else DEFAULT_OUTWARD
+
+
+def set_outward_policy(db, mode):
+    if mode not in OUTWARD_MODES:
+        raise ValueError(f"policy must be one of {OUTWARD_MODES}")
+    db.execute("INSERT INTO meta(key,value) VALUES('outward_policy',?) "
+               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (mode,))
+    db.commit()
+    return outward_policy(db)
+
+
+def caller_outward(db, caller):
+    """May this particular caller route outward, whatever the global switch.
+
+    The global policy is one switch for the whole system, and that turned out
+    to be too blunt to live with. Consolidation has to reach a hosted model to
+    run at all, so scheduling it nightly meant leaving the switch on
+    permanently -- which also let the being send speech outward to answer a
+    world question, unattended, with nobody deciding that.
+
+    So a caller can be granted outward reach on its own. The global switch
+    stays off, one caller is allowed through it, and everything else is
+    refused exactly as before. Default 0: a caller gains nothing by existing.
+    """
+    r = db.execute("SELECT can_outward FROM callers WHERE caller=?",
+                   (caller,)).fetchone()
+    return bool(r and r[0])
+
+
+def set_caller_outward(db, caller, allowed):
+    db.execute("UPDATE callers SET can_outward=? WHERE caller=?",
+               (1 if allowed else 0, caller))
+    db.commit()
+    return caller_outward(db, caller)
+
+
+def release_outward(db, caller, provider, question, extra=()):
+    """May this question leave the machine. Returns (ok, reason), and logs.
+
+    Logged whether or not it is allowed, with the provider named and the
+    question recorded -- the question is the caller's own text, not the
+    person's speech, so keeping it is not the second-store problem the access
+    log avoids elsewhere. What was found in the store is counted, not copied.
+
+    'ask' routes through the same approval queue a read does, so the person
+    sees what would leave before it leaves.
+    """
+    args = {'question': question, 'provider': provider,
+            'fragments': len(extra)}
+    mode = outward_policy(db)
+    # a standing grant on the caller lifts the global 'off' for that caller
+    # only, and is logged with the same line as any other release
+    if mode == 'off' and caller_outward(db, caller):
+        mode = 'allow'
+        args['via'] = 'standing grant on the caller'
+    if mode == 'off':
+        log(db, caller, 'route_outward', args, 'denied',
+            f'outward routing is off; nothing was sent to {provider}')
+        return False, (f"answering this needs a model that is not on this "
+                       f"machine ({provider}), and outward routing is off. "
+                       f"Nothing was sent.")
+    ok, why = decide(db, caller, 'search_memory', args)
+    if not ok:
+        log(db, caller, 'route_outward', args, 'denied', why)
+        return False, why
+    if mode == 'ask':
+        allowed, why2 = ask(db, caller, 'route_outward', args,
+                            [{'id': provider}],
+                            [f"send to {provider}: {question}"]
+                            + [f"  with: {t}" for t in extra])
+        log(db, caller, 'route_outward', args,
+            'allowed' if allowed else 'denied', why2)
+        return allowed, why2
+    log(db, caller, 'route_outward', args, 'allowed',
+        f'{why}; outward routing is on, sent to {provider}')
+    return True, f'sent to {provider}'
 
 
 def answer_or_search(db, caller, secret, query, limit=DEFAULT_SEARCH_LIMIT,
@@ -537,7 +654,68 @@ def answer_or_search(db, caller, secret, query, limit=DEFAULT_SEARCH_LIMIT,
                     'from': got['source_kind'], 'source_ids': got['source_ids'],
                     'seconds': got['seconds'], 'released': []}
     hits = search_memory(db, caller, secret, query, limit=limit, **kw)
-    return {'answered_directly': False, 'answer': None, 'released': hits}
+    if hits:
+        return {'answered_directly': False, 'answer': None, 'released': hits}
+    return reason_about(db, caller, query)
+
+
+def reason_about(db, caller, query, context=(), log_as='reason'):
+    """Try to work the answer out, rather than find it.
+
+    Split out of answer_or_search and made callable on its own, because the
+    routing was wrong in a way that would have wasted a reasoning provider the
+    day one arrived. answer_or_search returned the moment the search found
+    anything, so a question that needed thinking about never reached this at
+    all -- and a search almost always finds SOMETHING, since it ranks by
+    similarity and returns the best few whether or not they answer anything.
+    So "what should I do about the deadline" retrieved three lines mentioning
+    the deadline, none of which answered it, and the caller composed a refusal
+    about the deadline instead of reasoning about it.
+
+    Now the caller tries to compose an answer from what was found, and when
+    that fails BECAUSE the fragments do not answer the question, it comes here
+    with those fragments as context. Retrieved and unhelpful is not the same
+    as absent, and the fragments are the useful part of what was retrieved
+    even when they do not contain the answer.
+
+    context leaves the machine along with the question if the provider is not
+    local. That is a wider disclosure than the question alone, and it is the
+    reason cap.outward_text lists context: release_outward counts the
+    fragments and the person approving sees them.
+    """
+    import capability as cap
+    payload = {'question': query}
+    if context:
+        payload['context'] = list(context)
+    outward = None
+    for task in ('answer_with_reasoning', 'answer_from_world'):
+        try:
+            provider, _ = cap.route(task)
+        except cap.NoProvider as e:
+            outward = {'task': task, 'reason': str(e)}
+            continue
+        # the outward permission is asked inside cap.ask now, so that every
+        # caller gets it and not just this one
+        try:
+            reply, via = cap.ask(task, payload, db=db, caller=caller)
+        except cap.OutwardRefused as e:
+            log(db, caller, log_as, {'query': query,
+                                     'fragments': len(context)},
+                'denied', str(e))
+            return {'answered_directly': False, 'answer': None, 'released': [],
+                    'outward': {'provider': provider.name, 'refused': str(e)}}
+        if reply.get('error'):
+            outward = {'task': task, 'reason': reply['error']}
+            continue
+        log(db, caller, log_as,
+            {'query': query, 'fragments': len(context)}, 'allowed',
+            f"reasoned by {via['provider']} over {len(context)} fragment(s)")
+        return {'answered_directly': True, 'answer': reply.get('answer'),
+                'from': via['provider'], 'released': [], 'outward': via,
+                'reasoned': True}
+    return {'answered_directly': False, 'answer': None, 'released': [],
+            'outward': outward,
+            'silent_because': (outward or {}).get('reason', 'nothing to try')}
 
 
 def fetch_observation(db, caller, secret, id, with_body=True):

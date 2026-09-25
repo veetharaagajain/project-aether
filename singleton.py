@@ -66,6 +66,17 @@ def take(name, what, consequence, process='live.py'):
     return fh
 
 
+def held(name):
+    """Does this process already hold that lock.
+
+    Needed because the lock moved from the command-line entry point down to
+    the function that actually captures: main() takes it, then run_stream
+    checks whether it needs to. flock from a second descriptor in the same
+    process would conflict with itself, so asking has to be possible.
+    """
+    return str(lock_path(name)) in _HELD
+
+
 def lock_path(name):
     """Where a given lock lives. One definition, so nothing can name it twice
     and drift -- which it briefly did."""

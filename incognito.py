@@ -242,8 +242,13 @@ def forget_sessions(db, sessions, drop_audio=True):
 
 
 def _apply(db, plan, reason, drop_audio=True):
+    import memory as mem
     oids = [o['id'] for o in plan['observations']]
     bids = [b['id'] for b in plan['beliefs']]
+    # captured before the delete, because repairing the window index needs to
+    # know where the deleted rows were and by then they are gone
+    where = [{'id': o['id'], 'session': o['session'],
+              'started_at': o['started_at']} for o in plan['observations']]
 
     if oids:
         q = ",".join("?" * len(oids))
@@ -288,5 +293,10 @@ def _apply(db, plan, reason, drop_audio=True):
                 dropped_blobs.append(d)
         _tomb(db, [(d, 'audio') for d in dropped_blobs], reason)
     db.commit()
+    # last, and not optional: the windows table keeps the joined text of its
+    # span, so until this runs the deleted words are still in the index that
+    # searches surroundings
+    win = mem.repair_windows(db, where)
     return {'observations': len(oids), 'beliefs': len(bids),
-            'audio_blobs': len(dropped_blobs), 'log_rows_scrubbed': scrubbed}
+            'audio_blobs': len(dropped_blobs), 'log_rows_scrubbed': scrubbed,
+            'windows_dropped': win['dropped'], 'windows_rebuilt': win['rebuilt']}

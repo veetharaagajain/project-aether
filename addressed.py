@@ -241,11 +241,15 @@ def cheap_rungs(record, capturing=True):
 
 def ask_model(utterance, context_lines=(), presence='no evidence'):
     """The last rung. Returns (addressed, audience, seconds)."""
-    import relevance as rel
-    payload = json.dumps({'utterance': utterance,
+    import capability as cap
+    try:
+        r, via = cap.ask('is_addressed',
+                         {'utterance': utterance,
                           'context': "\n".join(context_lines),
-                          'presence': presence}).encode()
-    r = rel.request(f"addressed {len(payload)}\n", payload, REPLY_BUDGET_S)
+                          'presence': presence},
+                         budget=REPLY_BUDGET_S)
+    except cap.NoProvider as e:
+        raise NotAddressed('no provider', str(e).splitlines()[0])
     if r.get('unavailable'):
         raise NotAddressed('model unavailable', r['unavailable'])
     if r.get('error'):
@@ -352,3 +356,57 @@ def hold_attention(attention, now=None):
     now = time.time() if now is None else now
     attention['until'] = now + ATTENTION_S
     return attention
+
+
+# Words that carry no subject to look anything up by. A remainder made only of
+# these is not a question about the record, whatever its grammar.
+EMPTY_TOKENS = {
+    'a', 'about', 'am', 'and', 'anything', 'are', 'as', 'at', 'be', 'been',
+    'but', 'can', 'could', 'did', 'do', 'does', 'else', 'for', 'from', 'go',
+    'going', 'good', 'have', 'hello', 'hey', 'hi', 'how', 'i', 'if', 'in',
+    'is', 'it', 'just', 'know', 'me', 'my', 'next', 'no', 'not', 'now', 'of',
+    'ok', 'okay', 'on', 'or', 'should', 'so', 'some', 'something', 'that',
+    'the', 'then', 'there', 'they', 'think', 'this', 'to', 'up', 'us', 'was',
+    'we', 'well', 'were', 'what', 'when', 'where', 'which', 'who', 'why',
+    'will', 'with', 'would', 'yeah', 'yes', 'you', 'your',
+}
+
+
+def strip_wake(text, name):
+    """The utterance with the name taken off, and what is left of it.
+
+    Returns (remainder, kind) where kind is one of:
+
+      'bare'      nothing but the name. "Jarvis?"
+      'topicless' words, but none that anything could be looked up by.
+                  "Jarvis, what do you think I should do next"
+      'question'  a remainder with a subject in it
+
+    This exists because the name settled whether it was addressed and then
+    the WHOLE utterance, name included, was handed on as the thing to answer.
+    So "Jarvis?" was answered as a question about Jarvis -- "Nothing about
+    Jarvis in what's been said" -- and "what do you think I should do next"
+    came back as "Nothing about nothing has been said here", the topic
+    extractor having found no subject and said so literally.
+
+    A bare name is not a question. A question with no subject in it is a
+    question for a reasoning model, not a search over what was said. Neither
+    should produce a refusal about the wrong thing.
+    """
+    words = (text or '').split()
+    keep = []
+    for i, w in enumerate(words):
+        bare = re.sub(r"[^A-Za-z']", '', w)
+        head = i < WAKE_HEAD_TOKENS
+        tail = i == len(words) - 1
+        if (head or tail) and wake_matches(bare, name):
+            continue
+        keep.append(w)
+    remainder = ' '.join(keep).strip(' ,.?!;:')
+    toks = [re.sub(r"[^a-z0-9']", '', t.lower()) for t in remainder.split()]
+    toks = [t for t in toks if t]
+    if not toks:
+        return remainder, 'bare'
+    if all(t in EMPTY_TOKENS for t in toks):
+        return remainder, 'topicless'
+    return remainder, 'question'

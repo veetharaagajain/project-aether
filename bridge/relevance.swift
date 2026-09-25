@@ -205,6 +205,16 @@ speech, sometimes lines found in their record. If it plainly contains the \
 answer, give it in ONE SHORT SENTENCE OF YOUR OWN, and separately copy out the \
 single line you took it from.
 
+EACH LINE IS WRITTEN AS: [date] speaker: what they said
+
+The date and the speaker are part of the record, not part of the sentence \
+somebody spoke. Use them. A question about WHEN something happened is usually \
+answered by the date on the line, not by words inside it -- "[15 May 2023] \
+Jon: I'm currently reading The Lean Startup" says that he started it around \
+May 2023, and answering "he doesn't say" would be wrong. A question about WHO \
+did something is answered by the speaker on the line. When you copy the \
+supporting line, copy the whole line including its date and speaker.
+
 Answer in your own words. Do not read the line back. "Sausage croissant for \
 breakfast" is the evidence; "You had a sausage croissant" is the answer. The \
 person is listening to this out loud and already said the original, so \
@@ -223,6 +233,127 @@ Declining is cheap and correct: the question will simply be looked up properly \
 instead. Answering wrongly is not, because nobody downstream can tell your \
 answer from one that was checked.
 """
+
+
+// --- saying that it does not know ------------------------------------------
+// When the search finds nothing that answers, the old behaviour was silence,
+// which from the room is indistinguishable from being ignored. This composes
+// the refusal the same way an answer is composed: from what was actually
+// retrieved, not from a fixed string.
+//
+// The schema is shaped by the one thing this must never do, which is let a
+// near miss arrive sounding like an answer. So the nearby material is a
+// separate field from the sentence, and it carries its own supporting line, so
+// recall.py can check that the nearby part was really said before any of it is
+// spoken. And `needsOutsideKnowledge` separates "nobody has said" from "this was never a
+// question about what was said", because claiming to have looked and found
+// nothing is false when the question needed knowledge of the world instead.
+func notFoundSchema() throws -> GenerationSchema {
+    let root = DynamicGenerationSchema(
+        name: "NotFound",
+        description: "a spoken reply saying the answer is not in what was heard",
+        properties: [
+            .init(name: "topic",
+                  description: "two or three words naming what was asked "
+                             + "about, taken from the question itself",
+                  schema: DynamicGenerationSchema(type: String.self)),
+            .init(name: "needsOutsideKnowledge",
+                  description: "FALSE for almost everything. False whenever "
+                             + "the answer is something a person could simply "
+                             + "have said out loud -- their plans, meals, "
+                             + "appointments, work, who they saw, what was "
+                             + "decided, anything about their own life. TRUE "
+                             + "only for questions answerable solely from "
+                             + "facts about the world or from working "
+                             + "something out: why the sky is blue, how an "
+                             + "engine works, what 17 times 4 is",
+                  schema: DynamicGenerationSchema(type: Bool.self)),
+            .init(name: "closestLine",
+                  description: "the NUMBER of the line that is closest in "
+                             + "subject to the question -- same part of their "
+                             + "life, even though it does not answer it. 0 if "
+                             + "none of them is close or there are no lines",
+                  schema: DynamicGenerationSchema(type: Int.self)),
+            .init(name: "nearbyFact",
+                  description: "the related thing, in a few words taken from "
+                             + "the lines you were given; empty if nearby "
+                             + "is false",
+                  schema: DynamicGenerationSchema(type: String.self)),
+            .init(name: "support",
+                  description: "the single line you took nearbyFact from, "
+                             + "copied exactly; empty if nearby is false",
+                  schema: DynamicGenerationSchema(type: String.self)),
+            .init(name: "reply",
+                  description: "used only when needsOutsideKnowledge is true: "
+                             + "one short sentence saying this is not "
+                             + "something you can answer from what has been "
+                             + "said here. Empty otherwise",
+                  schema: DynamicGenerationSchema(type: String.self))
+        ])
+    return try GenerationSchema(root: root, dependencies: [])
+}
+
+let NOTFOUND_INSTRUCTIONS = """
+Someone asked a question and the record does not answer it. Say so out loud, \
+in one short sentence, in a way that is actually useful.
+
+You do not write the sentence. You supply its parts and something else \
+assembles them, so that the refusal always comes first and the related thing \
+can never be mistaken for the answer.
+
+Give the topic: a short noun phrase naming what they asked about, taken from \
+their question, that reads naturally after the words "nothing about". \
+"breakfast", "the dentist", "tomorrow's meeting". Not a clause: never "dentist \
+said", never "breakfast location".
+
+Then look at each line below and ask whether it is about the same area of \
+their life as the question. Meals belong with meals, appointments with \
+appointments, work with work, one person with that same person. Asked about \
+dinner, a line about lunch IS related and worth offering -- it is the wrong \
+meal, which is precisely why mentioning it helps: they can see you looked and \
+see what you have instead. Asked about the dentist, a line about a moved \
+meeting is NOT related, because the only thing they share is being on a \
+calendar.
+
+Put its NUMBER in closestLine, put the thing itself in nearbyFact in a few \
+words taken from that line, and copy the line into support exactly as it \
+appears. Never write a nearbyFact that is not in the lines you were given in \
+this request. When no line is in the same area, or there are no lines, put 0 \
+in closestLine and leave the rest empty.
+
+needsOutsideKnowledge is false for almost every question you will see. \
+"Where am I having dinner", "what did the dentist say", "when is the meeting" \
+are all things somebody could have said out loud, so they are false even \
+though nobody did say them -- the record being empty is exactly the situation \
+you are replying to, and it is not what this field is about.
+
+Set it true only when the question could not be answered by anyone recalling \
+speech at all -- when no amount of listening to this person would ever produce \
+the answer, because the answer is a fact about the world or the result of a \
+calculation. Ask yourself: could someone have simply told me this? If yes, \
+false. If the answer would have to be worked out or looked up, true. \
+Then the reply must not mention the record being empty, because that would be \
+a lie about having looked. Name the subject and say it is not something you \
+can answer from what has been said here. Leave nearby false.
+"""
+
+struct NotFoundRequest: Codable {
+    let question: String
+    let transcript: String
+}
+
+struct NotFoundReply: Codable {
+    var ok: Bool
+    var needsOutsideKnowledge: Bool = false
+    var topic: String = ""
+    var closestLine: Int = 0
+    var nearbyFact: String = ""
+    var support: String = ""
+    var reply: String = ""
+    var seconds: Double = 0
+    var error: String? = nil
+    var unavailable: String? = nil
+}
 
 struct RecallRequest: Codable {
     let question: String
@@ -320,6 +451,135 @@ struct AddressedReply: Codable {
     var ok: Bool
     var addressed: Bool = false
     var audience: String = ""
+    var seconds: Double = 0
+    var error: String? = nil
+    var unavailable: String? = nil
+}
+
+
+// --- noticing something worth concluding ------------------------------------
+// The hard part is not writing a belief, it is deciding that something deserves
+// one. Most speech does not: filler, thinking aloud, the same thing said three
+// ways, an arrangement that changed ten minutes later. A system that concludes
+// from every conversation fills the store with noise that then competes to
+// answer questions, and the fading rule cannot rescue that -- it measures
+// whether something was returned to, not whether it should have been written.
+//
+// So this is classify and then compose, in one call: the schema forces the
+// judgement first and the sentence second, and a false `worth` means the
+// remaining fields are ignored.
+func concludeSchema() throws -> GenerationSchema {
+    let root = DynamicGenerationSchema(
+        name: "Conclusion",
+        description: "whether this stretch of talk is worth concluding from",
+        properties: [
+            .init(name: "worth",
+                  description: "true only if this states something about the "
+                             + "person that will still be true tomorrow -- a "
+                             + "decision, a preference, a plan, a fact about "
+                             + "their life",
+                  schema: DynamicGenerationSchema(type: Bool.self)),
+            .init(name: "statement",
+                  description: "the conclusion in one short sentence about the "
+                             + "person, in the third person; empty if worth is "
+                             + "false",
+                  schema: DynamicGenerationSchema(type: String.self)),
+            .init(name: "about",
+                  description: "one or two words for what it concerns, lower "
+                             + "case, e.g. transcription, health, work, travel; "
+                             + "empty if worth is false",
+                  schema: DynamicGenerationSchema(type: String.self)),
+            .init(name: "support",
+                  description: "the single line from the transcript the "
+                             + "conclusion rests on, copied exactly; empty if "
+                             + "worth is false",
+                  schema: DynamicGenerationSchema(type: String.self))
+        ])
+    return try GenerationSchema(root: root, dependencies: [])
+}
+
+let CONCLUDE_INSTRUCTIONS = """
+You are reading a stretch of what someone said, and deciding whether it \
+contains something worth remembering about them.
+
+Say TRUE when the person states any of these about themselves:
+  a decision they have made -- "I'm staying on the Apple recogniser"
+  a preference they hold -- "I can't work in the afternoons any more"
+  a plan -- "I'll clear the spare room out before then"
+  a fact about their life or work -- "my sister's flight lands on the fourteenth"
+
+If one of those is in there, say true. It does not have to be important or \
+final, only about the person and still true tomorrow.
+
+Say FALSE for: filler and thinking aloud with nothing settled; the same point \
+merely restated; questions; small talk; and anything decided differently later \
+in the same stretch -- if they say Thursday, then Friday, then give up, nothing \
+was decided.
+
+Say FALSE for anything that is not about THIS PERSON. Much of what is heard is \
+a television, a film or a podcast playing near them. Dialogue between \
+characters, and facts from a programme, are not things to remember about the \
+person who had it on.
+
+When true, write ONE short sentence in the third person about THIS transcript, \
+give one or two lower case words for what it concerns, and copy out the single \
+line it rests on.
+
+Write only what this transcript says. The examples above are illustrations of \
+the KIND of thing to look for -- never copy them out as your answer. If the \
+transcript is about a flight, the conclusion is about a flight.
+"""
+
+func supersedesSchema() throws -> GenerationSchema {
+    let root = DynamicGenerationSchema(
+        name: "Supersedes",
+        description: "whether a new conclusion replaces an older one",
+        properties: [
+            .init(name: "supersedes",
+                  description: "true only if the new statement contradicts or "
+                             + "updates the old one about the same thing, so "
+                             + "that both cannot be true",
+                  schema: DynamicGenerationSchema(type: Bool.self))
+        ])
+    return try GenerationSchema(root: root, dependencies: [])
+}
+
+let SUPERSEDES_INSTRUCTIONS = """
+You are given an older conclusion about someone and a newer one. Decide whether \
+the newer one REPLACES the older, meaning they are about the same thing and \
+both cannot be true at once.
+
+Say false when they are merely related, or about different things, or when both \
+can be true together. Two conclusions can sit side by side; replacing one is \
+saying the person changed their mind or the situation changed.
+
+Say false when unsure. A wrongly replaced conclusion disappears from what the \
+system thinks, and only a person looking at the chain would find it.
+"""
+
+struct ConcludeRequest: Codable {
+    let transcript: String
+}
+
+struct ConcludeReply: Codable {
+    var ok: Bool
+    var worth: Bool = false
+    var statement: String = ""
+    var about: String = ""
+    var support: String = ""
+    var seconds: Double = 0
+    var error: String? = nil
+    var unavailable: String? = nil
+}
+
+struct SupersedesRequest: Codable {
+    let old: String
+    let new: String
+}
+
+struct SupersedesReply: Codable {
+    var ok: Bool
+    var supersedes: Bool = false
     var seconds: Double = 0
     var error: String? = nil
     var unavailable: String? = nil
@@ -516,6 +776,85 @@ struct Bridge {
         writeRecall(r)
     }
 
+
+    static func writeNotFound(_ r: NotFoundReply) {
+        if let d = try? JSONEncoder().encode(r) {
+            FileHandle.standardOutput.write(d)
+            FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+        }
+    }
+
+    static func handleNotFound(_ body: Data) async {
+        guard let req = try? JSONDecoder().decode(NotFoundRequest.self, from: body)
+        else { writeNotFound(NotFoundReply(ok: false, error: "bad json")); return }
+        if let why = available() {
+            var r = NotFoundReply(ok: false)
+            r.unavailable = why
+            r.error = "model unavailable"
+            writeNotFound(r)
+            return
+        }
+        let t = Date()
+        let out = await withTaskGroup(of: NotFoundReply?.self) { g -> NotFoundReply in
+            g.addTask {
+                do {
+                    let s = LanguageModelSession(instructions: NOTFOUND_INSTRUCTIONS)
+                    // The framing matters more than the instructions did.
+                    // Told the lines "do not answer it", the model concluded
+                    // nothing was close to it either and returned 0 every
+                    // time, including lunch against dinner. Asking the
+                    // selection question directly, and separating "does not
+                    // answer" from "is not about the same thing", is what
+                    // made it start choosing.
+                    let body = req.transcript.isEmpty
+                        ? "Nothing at all was found in the record, so "
+                          + "closestLine is 0."
+                        : "None of these lines answers the question. That is "
+                          + "settled and not what you are deciding.\n\n"
+                          + req.transcript
+                          + "\n\nWhich ONE of those lines, if any, is about "
+                          + "the same part of this person's life as the "
+                          + "question -- the same meal, the same person, the "
+                          + "same appointment, the same piece of work? It "
+                          + "will not answer them; that is expected and is "
+                          + "not a reason to pick 0. Pick 0 only if every "
+                          + "line is about something genuinely unconnected."
+                    let r = try await s.respond(
+                        to: "Question: \(req.question)\n\n\(body)",
+                        schema: try notFoundSchema(),
+                        options: GenerationOptions(temperature: 0.0))
+                    var o = NotFoundReply(ok: true)
+                    o.needsOutsideKnowledge = (try? r.content.value(
+                        Bool.self, forProperty: "needsOutsideKnowledge")) ?? false
+                    o.topic = (try? r.content.value(
+                        String.self, forProperty: "topic")) ?? ""
+                    o.closestLine = (try? r.content.value(
+                        Int.self, forProperty: "closestLine")) ?? 0
+                    o.nearbyFact = (try? r.content.value(
+                        String.self, forProperty: "nearbyFact")) ?? ""
+                    o.support = (try? r.content.value(
+                        String.self, forProperty: "support")) ?? ""
+                    o.reply = (try? r.content.value(
+                        String.self, forProperty: "reply")) ?? ""
+                    return o
+                } catch {
+                    return NotFoundReply(ok: true, error: "\(error)")
+                }
+            }
+            g.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(PER_CALL_TIMEOUT_S * 1e9))
+                return nil
+            }
+            let first = await g.next() ?? nil
+            g.cancelAll()
+            return first ?? NotFoundReply(
+                ok: true, error: "timed out after \(PER_CALL_TIMEOUT_S)s")
+        }
+        var r = out
+        r.seconds = Date().timeIntervalSince(t)
+        writeNotFound(r)
+    }
+
     static func handleAddressed(_ body: Data) async {
         let enc = JSONEncoder()
         enc.outputFormatting = [.withoutEscapingSlashes]
@@ -590,6 +929,95 @@ struct Bridge {
         out(r)
     }
 
+    static func handleConclude(_ body: Data) async {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.withoutEscapingSlashes]
+        func out(_ r: ConcludeReply) {
+            if let d = try? enc.encode(r) {
+                FileHandle.standardOutput.write(d)
+                FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+            }
+        }
+        guard let req = try? JSONDecoder().decode(ConcludeRequest.self, from: body)
+        else { out(ConcludeReply(ok: false, error: "bad json")); return }
+        if let why = available() {
+            var r = ConcludeReply(ok: false); r.unavailable = why
+            r.error = "model unavailable"; out(r); return
+        }
+        let t = Date()
+        let res = await withTaskGroup(of: ConcludeReply?.self) { g -> ConcludeReply in
+            g.addTask {
+                do {
+                    let s = LanguageModelSession(instructions: CONCLUDE_INSTRUCTIONS)
+                    let r = try await s.respond(
+                        to: "Transcript:\n\(req.transcript)\n\nIs there a "
+                          + "conclusion here worth remembering about this person?",
+                        schema: try concludeSchema(),
+                        options: GenerationOptions(temperature: 0.0))
+                    var o = ConcludeReply(ok: true)
+                    o.worth = (try? r.content.value(Bool.self, forProperty: "worth")) ?? false
+                    o.statement = (try? r.content.value(String.self, forProperty: "statement")) ?? ""
+                    o.about = (try? r.content.value(String.self, forProperty: "about")) ?? ""
+                    o.support = (try? r.content.value(String.self, forProperty: "support")) ?? ""
+                    return o
+                } catch { return ConcludeReply(ok: true, error: "\(error)") }
+            }
+            g.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(PER_CALL_TIMEOUT_S * 1e9))
+                return nil
+            }
+            let first = await g.next() ?? nil
+            g.cancelAll()
+            return first ?? ConcludeReply(ok: true,
+                                          error: "timed out after \(PER_CALL_TIMEOUT_S)s")
+        }
+        var r = res; r.seconds = Date().timeIntervalSince(t); out(r)
+    }
+
+    static func handleSupersedes(_ body: Data) async {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.withoutEscapingSlashes]
+        func out(_ r: SupersedesReply) {
+            if let d = try? enc.encode(r) {
+                FileHandle.standardOutput.write(d)
+                FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+            }
+        }
+        guard let req = try? JSONDecoder().decode(SupersedesRequest.self, from: body)
+        else { out(SupersedesReply(ok: false, error: "bad json")); return }
+        if let why = available() {
+            var r = SupersedesReply(ok: false); r.unavailable = why
+            r.error = "model unavailable"; out(r); return
+        }
+        let t = Date()
+        let res = await withTaskGroup(of: SupersedesReply?.self) { g -> SupersedesReply in
+            g.addTask {
+                do {
+                    let s = LanguageModelSession(instructions: SUPERSEDES_INSTRUCTIONS)
+                    let r = try await s.respond(
+                        to: "Older conclusion:\n\(req.old)\n\nNewer "
+                          + "conclusion:\n\(req.new)\n\nDoes the newer one "
+                          + "replace the older one?",
+                        schema: try supersedesSchema(),
+                        options: GenerationOptions(temperature: 0.0))
+                    var o = SupersedesReply(ok: true)
+                    o.supersedes = (try? r.content.value(
+                        Bool.self, forProperty: "supersedes")) ?? false
+                    return o
+                } catch { return SupersedesReply(ok: true, error: "\(error)") }
+            }
+            g.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(PER_CALL_TIMEOUT_S * 1e9))
+                return nil
+            }
+            let first = await g.next() ?? nil
+            g.cancelAll()
+            return first ?? SupersedesReply(ok: true,
+                                            error: "timed out after \(PER_CALL_TIMEOUT_S)s")
+        }
+        var r = res; r.seconds = Date().timeIntervalSince(t); out(r)
+    }
+
     static func write(_ r: Reply) {
         let enc = JSONEncoder()
         enc.outputFormatting = [.withoutEscapingSlashes]
@@ -630,9 +1058,24 @@ struct Bridge {
                 await handleRecall(body)
                 continue
             }
+            if cmd == "notfound", parts.count > 1, let n = Int(parts[1]),
+               let body = input.bytes(n) {
+                await handleNotFound(body)
+                continue
+            }
             if cmd == "addressed", parts.count > 1, let n = Int(parts[1]),
                let body = input.bytes(n) {
                 await handleAddressed(body)
+                continue
+            }
+            if cmd == "conclude", parts.count > 1, let n = Int(parts[1]),
+               let body = input.bytes(n) {
+                await handleConclude(body)
+                continue
+            }
+            if cmd == "supersedes", parts.count > 1, let n = Int(parts[1]),
+               let body = input.bytes(n) {
+                await handleSupersedes(body)
                 continue
             }
             guard cmd == "judge", parts.count > 1, let n = Int(parts[1]),

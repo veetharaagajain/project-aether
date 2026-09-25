@@ -30,6 +30,7 @@ import json
 import os
 import queue
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -83,6 +84,16 @@ class SessionState:
 
     def __init__(self, speaker='owner', locale=None):
         self.t0 = time.time()
+        # When the microphone actually started, which is not when this object
+        # was built: the models warm up in between, and on this machine that is
+        # several seconds. Utterance times are counted in frames from the first
+        # block, so converting them with t0 puts every one of them early by the
+        # whole warm-up -- which is why the self-hearing suppression stopped
+        # firing and its own replies went back into the store as an unknown
+        # voice. Set by run_stream from the capture. Third time this project has
+        # measured from construction instead of from when the thing started;
+        # see CLAUDE.md.
+        self.audio_epoch = None
         self.audio_s = 0.0
         self.noise_db = None
         self.speech_db = None
@@ -120,6 +131,13 @@ class SessionState:
         # per-utterance database read is not what this is for.
         self.capturing = True
         self.silent = deque(maxlen=200)     # what it heard and did not answer
+        self.self_heard = 0                 # utterances that were its own voice
+        self.write_failures = 0             # observations the store refused
+        # kept current by run_stream from the capture, so the conversion from
+        # frame-counted utterance time to wall time can correct for it
+        self.clock_drift = 0.0
+        self.clock_drift_rate = 0.0
+        self.clock_untrusted = 0            # utterances judged under bad drift
         self._recent_plain = deque(maxlen=20)
         self._being_secret = None
         # the window in which follow-ups still count as addressed, opened by
@@ -422,11 +440,28 @@ def maybe_answer(session, u, out=sys.stdout):
         print(f"  [addressed check failed, staying quiet: {e}]", file=out)
         return None
 
+    # What is left once the name is taken off decides what this even is. The
+    # name settles whether it was addressed; it is not the thing being asked.
+    # Passing the whole utterance on made "Jarvis?" a question about Jarvis.
+    query, kind = ad.strip_wake(u['plain'], ad.wake_word(session.memory()))
+    if kind in ('bare', 'topicless'):
+        spoken = ACKNOWLEDGE if kind == 'bare' else None
+        if spoken:
+            import voice
+            voice.say(spoken, db=session.memory())
+        print(f"  [addressed with no question ({kind}): "
+              f"{'acknowledged' if spoken else 'stayed quiet'}]", file=out)
+        ch.publish({'kind': 'addressed', 'at': time.time(),
+                    'spoke': bool(spoken), 'text': u['plain'],
+                    'answer': spoken, 'rung': f'no question, {kind}',
+                    'detail': f'remainder {query!r}'})
+        return spoken
+
     t = time.perf_counter()
     try:
         import gate as g
         r = g.answer_or_search(session.memory(), 'being', session.being_secret(),
-                               u['plain'], session=session.id)
+                               query, session=session.id)
     except Exception as e:                                   # noqa: BLE001
         print(f"  [could not answer: {e}]", file=out)
         return None
@@ -439,11 +474,62 @@ def maybe_answer(session, u, out=sys.stdout):
         hits = [h for h in (r.get('released') or []) if h.get('role') == 'answer'] \
             or (r.get('released') or [])
         try:
-            spoken = rc.compose_from(u['plain'], [h['text'] for h in hits])['answer']
+            spoken = rc.compose_from(query, rc.format_lines(hits, expand=False))['answer']
         except Exception as e:                               # noqa: BLE001
-            print(f"  [found {len(hits)} fragment(s) but could not compose "
-                  f"an answer, staying quiet: {e}]", file=out)
+            # Not silence. Being spoken to and saying nothing is
+            # indistinguishable from being ignored, and it happened within
+            # minutes of this running. The refusal is composed from the same
+            # fragments the answer failed to come from, so it can say what is
+            # missing and what was near it, and it goes through the same
+            # grounding checks because it is still a claim about what was
+            # heard. See recall.compose_not_found.
+            why = str(e)
             spoken = None
+            kind = None
+            # ASK THE LOCAL JUDGEMENT FIRST, then reason only if it says this
+            # was never a recall question.
+            #
+            # The previous order reasoned before refusing, on the grounds that
+            # retrieved-and-unhelpful is not the same as absent. That is true
+            # and it was still the wrong order: "what did I have for breakfast"
+            # is a recall question with an honest local answer -- "Nothing
+            # about breakfast in what's been said" -- and reasoning about it
+            # sent the retrieved fragments to a paid hosted model and got back
+            # "There's no information here about what you ate", which is worse,
+            # slower, costs money, and puts speech over the network on every
+            # ordinary miss.
+            #
+            # compose_not_found already distinguishes the two: it raises
+            # NotRecallable exactly when the question needed knowledge or
+            # working out rather than recall. That is the signal to reason on,
+            # and it is free.
+            try:
+                nf = rc.compose_not_found(query, rc.format_lines(hits, expand=False))
+                spoken, kind = nf['answer'], nf['kind']
+                print(f"  [nothing answered it ({why}); saying so: "
+                      f"{kind}, nearby={nf['nearby']}]", file=out)
+            except rc.NotRecallable as nr:
+                # never about what anybody said, so this is what reasoning is
+                # for. The composed line is the fallback if reasoning cannot
+                # happen -- no provider, gate refused, over budget.
+                try:
+                    rr = g.reason_about(session.memory(), 'being', query,
+                                        context=rc.format_lines(hits, expand=False))
+                    if rr.get('answer'):
+                        spoken, kind = rr['answer'], 'reasoned'
+                        print(f"  [not a recall question ({nr.topic}); "
+                              f"reasoned by {rr['from']} over {len(hits)} "
+                              f"fragment(s)]", file=out)
+                except Exception as e_r:                     # noqa: BLE001
+                    print(f"  [could not reason: {e_r}]", file=out)
+                if not spoken:
+                    spoken, kind = nr.reply, 'not_recall'
+                    print(f"  [not a recall question ({nr.topic}); saying so]",
+                          file=out)
+            except Exception as e2:                          # noqa: BLE001
+                print(f"  [found {len(hits)} fragment(s), could not compose "
+                      f"an answer ({why}) or a refusal ({e2}), "
+                      f"staying quiet]", file=out)
     if not spoken:
         print(f"  [addressed, but nothing to say]", file=out)
         ch.publish({'kind': 'addressed', 'at': time.time(), 'spoke': False,
@@ -463,6 +549,69 @@ def maybe_answer(session, u, out=sys.stdout):
     return spoken
 
 
+# How far around its own speech to distrust the microphone. Both are the cost
+# of the fix, in opposite directions: too wide and a person talking over it is
+# lost, too narrow and the tail of its own sentence gets written down.
+#
+# SELF_LEAD covers the gate's own PREROLL_S, since a segment that opens just
+# after it starts talking already contains a quarter second from before.
+# SELF_TAIL covers room reverberation and the fact that playback ends at the
+# last sample, not at the last thing audible in the room.
+#
+# SELF_OVERLAP_DROP is why this is a fraction and not a boolean. Dropping any
+# segment that touches a speaking window would throw away a whole utterance
+# because its first 50 ms clipped the end of a reply. A segment is treated as
+# the machine's own only when most of it lies inside a window.
+# Said when it is called by name and nothing else. A fixed string, and
+# deliberately: this is not a claim about the record, it is the sound of
+# turning your head, and varying it would be affectation. A topicless
+# question gets silence instead, because "yes?" in answer to "what do you
+# think I should do next" is worse than nothing -- it would read as evasion
+# rather than as attention.
+ACKNOWLEDGE = "Yes?"
+
+SELF_LEAD_S = 0.30
+SELF_TAIL_S = 0.60
+SELF_OVERLAP_DROP = 0.5
+
+
+def self_heard(session, us, t0):
+    """Which of these utterances are the machine hearing itself.
+
+    Returns {index: (overlap fraction, what it was saying)} for the ones that
+    should not be stored.
+    """
+    import voice
+    # The wall clock the frame counter is anchored to, plus the measured
+    # offset between the audio clock and the wall clock. Falls back to t0 only
+    # for a file replay, which has no microphone and no speaker to hear.
+    base = session.audio_epoch or session.t0
+    drift = session.clock_drift
+    # the residual after correcting by the current offset: how far the offset
+    # itself moves across this segment. Absolute drift is corrected and does
+    # not matter; this is what is left.
+    span = max((us[-1]['end'] - us[0]['start']) if us else 0.0, 0.0)
+    trusted = abs(session.clock_drift_rate) * span <= SELF_TAIL_S
+    out = {}
+    for i, u in enumerate(us):
+        a, b = base + u['start'] + drift, base + u['end'] + drift
+        if b <= a:
+            continue
+        ov, which = voice.spoke_during(a, b, lead=SELF_LEAD_S, tail=SELF_TAIL_S)
+        frac = ov / (b - a)
+        if frac >= SELF_OVERLAP_DROP:
+            out[i] = (round(frac, 3), which)
+        elif not trusted and ov > 0:
+            # it overlapped but not enough to drop, and the clocks are too far
+            # apart for that judgement to mean anything. Said out loud rather
+            # than stored quietly as somebody's speech.
+            session.clock_untrusted += 1
+            print(f"  [clock drift {drift:+.2f}s: cannot tell whether "
+                  f"{u['plain'][:40]!r} was its own voice]", file=sys.stderr,
+                  flush=True)
+    return out
+
+
 def store_utterances(session, us, t0, blob):
     """Every utterance of this segment, into the memory store.
 
@@ -477,18 +626,43 @@ def store_utterances(session, us, t0, blob):
     # counts from the start of the session because that is what the measurement
     # needs; the store needs wall time, because forget() works on a window of
     # real minutes and a ULID carries the moment it was minted.
-    base = session.t0
-    for u in us:
-        mem.add_observation(
-            db, 'speech', base + u['start'], base + u['end'],
-            text=u['plain'], body=u,
-            session=session.id,
-            person_id=u.get('person_id'), person=u.get('person'),
-            person_decision=u.get('person_decision'),
-            speaker=u.get('speaker'),
-            audio=(dict(blob, offset=round(u['start'] - t0, 3))
-                   if blob else None),
-            config_digest=session.config_digest)
+    #
+    # Anchored to when the microphone opened, not to when this object was
+    # built. Using t0 put every stored timestamp early by the model warm-up --
+    # a few seconds, invisible in the viewer, and wrong.
+    base = session.audio_epoch or session.t0
+    mine = self_heard(session, us, t0)
+    for i, u in enumerate(us):
+        if i in mine:
+            # not stored, but not silent either: the count is published so the
+            # viewer can show it and a run can be checked afterwards
+            frac, which = mine[i]
+            session.self_heard += 1
+            ch.publish({'kind': 'self_heard', 'at': time.time(),
+                        'text': u['plain'], 'overlap': frac,
+                        'while_saying': (which or [''])[0]})
+            continue
+        try:
+            mem.add_observation(
+                db, 'speech', base + u['start'], base + u['end'],
+                text=u['plain'], body=u,
+                session=session.id,
+                person_id=u.get('person_id'), person=u.get('person'),
+                person_decision=u.get('person_decision'),
+                speaker=u.get('speaker'),
+                audio=(dict(blob, offset=round(u['start'] - t0, 3))
+                       if blob else None),
+                config_digest=session.config_digest)
+        except mem.Busy as e:
+            # a dropped observation is bad; a dead capture is worse, and it
+            # was the second that actually happened. Counted and published
+            # rather than raised, so it cannot be silent either.
+            session.write_failures += 1
+            print(f"  [STORE BUSY, observation dropped: {e}]", file=sys.stderr,
+                  flush=True)
+            ch.publish({'kind': 'store_busy', 'at': time.time(),
+                        'text': u['plain'], 'detail': str(e)})
+    return len(mine)
 
 
 def handle_segment(audio, t0, session, gap_before, out=sys.stdout):
@@ -610,7 +784,12 @@ def handle_segment(audio, t0, session, gap_before, out=sys.stdout):
 
 
 # --- the loops --------------------------------------------------------------
-STATUS_EVERY_S = 2.0
+# Every two seconds is right for a person watching a terminal and wrong for a
+# file that grows forever: at ~120 bytes a line that is 5 MB a day of "still
+# nothing". Under a supervisor the line still has a job -- it is how you tell a
+# living service from a wedged one -- so it drops to once a minute rather than
+# off, and launchd does not rotate anything.
+STATUS_EVERY_S = 2.0 if sys.stdout.isatty() else 60.0
 
 
 class Meters:
@@ -629,6 +808,7 @@ class Meters:
         self.too_short = 0
         self.segments_no_words = 0
         self.segments_with_words = 0
+        self.segments_dropped = 0
         self.gate_time = 0.0
 
     def diagnose(self, capture=None):
@@ -665,13 +845,69 @@ class Meters:
         return None
 
 
+# Closed segments waiting to be transcribed, measured and answered. Bounded,
+# because an unbounded one would hide exactly the backlog it is there to
+# absorb.
+SEGMENT_QUEUE_MAX = 12
+
+
 def run_stream(session, source, realtime=False, out=sys.stdout, meters=None,
                capture=None, quiet=False):
-    """Drive the gate from a frame source and process what it closes."""
+    """Drive the gate from a frame source and process what it closes.
+
+    THE LOCK IS TAKEN HERE, not in main(). It used to be taken by the
+    command-line entry point, which meant anything that imported this module
+    and called run_stream directly was a second live path with no lock at all
+    -- and that is not hypothetical, it is how I ran every test in the last
+    several rounds. Two of them captured, measured and published alongside the
+    service, which is what put seg 1 and seg 8 on the viewer at the same
+    moment, one on a fresh session reference and one on the baseline.
+
+    A lock on the entry point protects the entry point. A lock here protects
+    the thing that actually captures, which is what needed protecting.
+    """
+    if not singleton.held('live'):
+        take_lock()
     gate = Gate()
     m = meters or Meters()
     last_end = 0.0
     next_status = STATUS_EVERY_S
+
+    # THE PIPELINE RUNS OFF THIS THREAD. It used to run on it: a closed segment
+    # was transcribed, measured, scored, fingerprinted and answered inline,
+    # while frames piled up in a queue holding 6.4 seconds. Anything slower
+    # than that dropped audio, and dropped audio is missed speech. The first
+    # time it fired was 116 frames during start-up, with the Kokoro warm-up
+    # competing for the machine -- but the warm-up only made it visible. A long
+    # segment, a slow transcription or a reply that has to reason would all do
+    # the same, and none of those is a bug to be fixed once.
+    #
+    # So this thread now does the gate and nothing else, which is 0.1 ms a
+    # frame. One worker, not a pool, because segments must be processed in the
+    # order they were spoken.
+    segq = queue.Queue(maxsize=SEGMENT_QUEUE_MAX)
+
+    def worker():
+        while True:
+            item = segq.get()
+            if item is None:
+                segq.task_done()
+                return
+            audio, start, gap = item
+            try:
+                r = handle_segment(audio, start, session, gap, out)
+                if r is None:
+                    m.segments_no_words += 1
+                else:
+                    m.segments_with_words += 1
+            except Exception as e:                            # noqa: BLE001
+                print(f"  [segment failed: {type(e).__name__}: {e}]",
+                      file=sys.stderr, flush=True)
+            finally:
+                segq.task_done()
+
+    pump = threading.Thread(target=worker, daemon=True)
+    pump.start()
     for frame, t in source:
         f0 = time.perf_counter()
         closed, prob = gate.push(frame, t)
@@ -685,6 +921,11 @@ def run_stream(session, source, realtime=False, out=sys.stdout, meters=None,
         m.level_max = max(m.level_max, db)
         m.level_min = min(m.level_min, db)
         m.vad_max = max(m.vad_max, prob)
+        if capture is not None:
+            session.clock_drift = capture.drift
+            session.clock_drift_rate = capture.drift_rate
+            if session.audio_epoch is None and capture.opened_wall is not None:
+                session.audio_epoch = capture.opened_wall
         if prob >= VAD_THRESHOLD:
             m.vad_over += 1
         if gate.open and gate.just_opened:
@@ -696,6 +937,8 @@ def run_stream(session, source, realtime=False, out=sys.stdout, meters=None,
             extra = ''
             if capture is not None:
                 extra = (f", {capture.blocks} device block(s)"
+                         + f", clock drift {capture.drift:+.2f}s "
+                           f"({100*capture.drift_rate:+.1f}%)"
                          + (f", {capture.dropped} frame(s) dropped"
                             if capture.dropped else "")
                          + (f", status {list(capture.status)}"
@@ -717,16 +960,25 @@ def run_stream(session, source, realtime=False, out=sys.stdout, meters=None,
                 ch.publish({'kind': 'capture', 'at': time.time(),
                             'capturing': now_on,
                             'banner': inc.banner(session.memory())})
-            r = handle_segment(audio, start, session,
-                               max(0.0, start - last_end), out)
-            if r is None:
-                m.segments_no_words += 1
-            else:
-                m.segments_with_words += 1
+            try:
+                segq.put_nowait((audio, start, max(0.0, start - last_end)))
+            except queue.Full:
+                # the worker is more than SEGMENT_QUEUE_MAX segments behind,
+                # which is a real backlog and not a blip. Said out loud rather
+                # than blocking the gate, which is the thing this exists to
+                # keep running.
+                m.segments_dropped += 1
+                print(f"  [PIPELINE BEHIND: dropped a {len(audio)/SR:.1f}s "
+                      f"segment, {m.segments_dropped} so far]",
+                      file=sys.stderr, flush=True)
             last_end = start + len(audio) / SR
         elif gate.dropped_short:
             m.too_short += 1
             gate.dropped_short = False
+    # let the worker finish what it has before the summary is printed
+    segq.join()
+    segq.put(None)
+    pump.join(timeout=30)
     return m
 
 
@@ -745,6 +997,53 @@ def frames_from_file(path, realtime=False):
 
 
 QUEUE_MAX = 200              # ~6.4 s of audio at 32 ms a frame
+
+# How long the device may deliver nothing before we call it dead. Audio arrives
+# every 32 ms, so seconds of nothing is not a slow moment, it is a stopped
+# stream. Sleep is the case that matters: CoreAudio tears the input device down
+# and PortAudio does not raise, so the old loop sat in `continue` forever,
+# awake and deaf, with the lock still held. Exiting is what lets a supervisor
+# restart us into a working device; see service.py.
+STALL_S = 6.0
+STALL_START_S = 20.0         # ...and this long for the first block ever
+# Blocks arriving that are all exactly zero is a different failure with the
+# same result: the stream is open, the callback fires on time, and every
+# sample is digital silence. A Bluetooth input in the wrong profile does this,
+# and so does a denied microphone permission and a hardware mute. It is not a
+# quiet room -- a real microphone in a silent room still has a noise floor
+# around -60 dB, never -240.
+DEAD_SILENCE_S = 30.0
+
+# Utterance times are counted in frames; speaking windows are stamped from the
+# wall clock. Those are two different clocks and nothing was comparing them.
+# If the audio device runs even slightly fast or slow, or a frame is dropped,
+# the two drift apart, and the self-hearing suppression quietly stops lining up
+# with the thing it is suppressing -- with nothing noticing, which is the shape
+# of the four silent failures this project has already had.
+#
+# So the drift is measured every callback and reported. It is the difference
+# between how much wall time has passed since the stream opened and how much
+# audio the device has handed over. A constant small positive offset is normal
+# and is the buffer; growth is the failure.
+CLOCK_DRIFT_WARN_S = 0.50
+# ...and the rate, which is the one that actually decides anything. The offset
+# is corrected for: self_heard adds the measured drift before comparing, so a
+# large but steady offset is harmless. What is not correctable is how far the
+# offset moves DURING a segment, which is the rate times the segment length.
+# This machine sits around 3 percent, which over a 12-second segment is 0.36s
+# -- inside the tail margin, so the suppression still lines up.
+CLOCK_DRIFT_RATE_WARN = 0.06
+
+
+# Exit codes the supervisor reads. 0 is a clean stop and must not be restarted
+# into; the rest are conditions a restart might actually fix.
+EXIT_STALLED = 3             # the device died under us
+EXIT_LOCKED = 4              # somebody else holds the lock
+
+
+class AudioStalled(Exception):
+    """The input device stopped delivering. Not recoverable in place: the
+    stream has to be torn down and reopened, which means exiting."""
 
 
 class Capture:
@@ -765,16 +1064,73 @@ class Capture:
         self.status = {}         # PortAudio status flags, counted
         self.peak = 0.0
         self.carry = np.zeros(0, dtype='float32')
+        # set when the stream actually opens, not here. frames() is a
+        # generator, so the InputStream is not created until something starts
+        # iterating it, and everything between construction and that first
+        # next() -- model warm-up, in practice -- would otherwise count
+        # against the no-audio deadline. It did: a run with a working
+        # microphone reported "the device delivered nothing in 20s after
+        # opening" having never opened it. Exactly the mistake the drift
+        # baseline made, in the same class.
+        self.opened_t = None
+        self.opened_wall = None
+        self.last_block_t = None
+        self.last_nonzero_t = None
+        # Measured from the FIRST block, not from construction. The first
+        # version measured from __init__ and reported +0.75s of drift "after
+        # 0s of audio", because everything between building the object and the
+        # device handing over its first block -- opening the stream, and
+        # whatever else the process was doing -- was being counted as clock
+        # divergence. Drift is a difference in RATE between two clocks; a
+        # constant offset at the start is not drift, and reporting it as drift
+        # is a false alarm, which is no better than the silent failure this
+        # was built to prevent.
+        self.first_block_t = None
+        self.first_block_samples = 0
+        self.drift = 0.0          # wall seconds minus audio seconds, since then
+        self.drift_t = None
+        self.drift_rate = 0.0     # seconds of divergence per second
+        self.drift_max = 0.0
+        self.drift_warned = False
 
     def _callback(self, indata, frames, tinfo, status):
         if status:
             self.status[str(status)] = self.status.get(str(status), 0) + 1
         self.blocks += 1
+        now = time.monotonic()
+        self.last_block_t = now
         self.samples += len(indata)
+        # measured here rather than at the consumer: a frame waiting in the
+        # queue is behind by the queue depth, which is not drift
+        if self.first_block_t is None:
+            self.first_block_t = now
+            self.first_block_samples = self.samples
+        elapsed = now - self.first_block_t
+        heard = (self.samples - self.first_block_samples) / SR
+        prev, prev_t = self.drift, self.drift_t
+        self.drift = elapsed - heard
+        self.drift_t = elapsed
+        # the RATE of divergence, which is what decides whether correcting by
+        # the current offset is good enough inside one segment. This machine
+        # delivers audio about 3 percent slow, so the offset grows without
+        # bound and an absolute threshold on it would simply latch on forever;
+        # what matters is how far it moves during a segment.
+        if prev_t is not None and elapsed - prev_t > 1.0:
+            self.drift_rate = (self.drift - prev) / (elapsed - prev_t)
+        if abs(self.drift) > abs(self.drift_max):
+            self.drift_max = self.drift
+        if abs(self.drift_rate) > CLOCK_DRIFT_RATE_WARN and not self.drift_warned:
+            self.drift_warned = True
+            print(f"WARNING: the audio clock runs {100*self.drift_rate:+.1f}% "
+                  f"against the wall clock ({self.drift:+.2f}s apart over "
+                  f"{heard:.0f}s of audio). Self-hearing suppression compares the two and is "
+                  f"unreliable beyond this point.", file=sys.stderr, flush=True)
         x = indata[:, 0] if indata.ndim > 1 else indata
         p = float(np.abs(x).max()) if len(x) else 0.0
         if p > self.peak:
             self.peak = p
+        if p > 0.0:
+            self.last_nonzero_t = self.last_block_t
         # re-block to exactly FRAME samples. PortAudio is allowed to hand over
         # a different block size than the one asked for, and silero refuses
         # anything that is not 512 samples at 16 kHz, so this cannot be left
@@ -812,6 +1168,8 @@ class Capture:
                                     channels=1, dtype='float32')
         except Exception as e:
             print(f"WARNING: the device rejected these settings: {e}")
+        self.opened_t = time.monotonic()
+        self.opened_wall = time.time()
         with sd.InputStream(samplerate=SR, channels=1, dtype='float32',
                             blocksize=FRAME, callback=self._callback,
                             device=self.device):
@@ -820,8 +1178,36 @@ class Capture:
                 try:
                     frame = self.q.get(timeout=1.0)
                 except queue.Empty:
-                    if self.blocks == 0:
-                        print("WARNING: no audio has arrived from the device yet")
+                    now = time.monotonic()
+                    if self.last_block_t is None:
+                        if now - self.opened_t > STALL_START_S:
+                            raise AudioStalled(
+                                f"the device delivered nothing in "
+                                f"{STALL_START_S:.0f}s after opening")
+                        print("WARNING: no audio has arrived from the device yet",
+                              flush=True)
+                    elif (self.last_nonzero_t is None
+                          and now - self.opened_t > DEAD_SILENCE_S):
+                        raise AudioStalled(
+                            f"{self.blocks} block(s) arrived and every sample "
+                            f"in all of them was exactly zero. The device is "
+                            f"open but deaf: a Bluetooth input in the wrong "
+                            f"profile, a denied microphone permission, or a "
+                            f"hardware mute. Pin a known-good device with "
+                            f"--device.")
+                    elif (self.last_nonzero_t is not None
+                          and now - self.last_nonzero_t > DEAD_SILENCE_S):
+                        raise AudioStalled(
+                            f"the device has delivered nothing but digital "
+                            f"silence for {now - self.last_nonzero_t:.0f}s "
+                            f"after {self.blocks} block(s); it went deaf "
+                            f"without stopping")
+                    elif now - self.last_block_t > STALL_S:
+                        raise AudioStalled(
+                            f"the device stopped delivering "
+                            f"{now - self.last_block_t:.0f}s ago after "
+                            f"{self.blocks} block(s); it was probably torn "
+                            f"down by sleep or unplugged")
                     continue
                 yield frame, i * FRAME / SR
                 i += 1
@@ -892,7 +1278,7 @@ def main():
         take_lock()
     except AlreadyRunning as e:
         print(f"refusing to start: {e}", file=sys.stderr)
-        return 1
+        return EXIT_LOCKED
     realtime = '--realtime' in args
     locale = args[args.index('--locale') + 1] if '--locale' in args else None
     session = SessionState(locale=locale)
@@ -901,6 +1287,11 @@ def main():
     # this happens once at start-up; folding it into the first utterance's
     # latency would report a number no later utterance ever pays.
     import diarize as dz
+    import voice
+    # off the hot path: building Kokoro's phonemiser takes seconds, and paying
+    # that on the first thing anybody says would be worse than the voice it
+    # replaces. Until it finishes, voice.say falls through to the system voice.
+    voice.warm_up()
     t_warm = time.perf_counter()
     warm = np.zeros(SR, dtype='float32')
     asr().transcribe_pcm(warm, session.locale)
@@ -941,18 +1332,31 @@ def main():
     print(f"locale: {session.locale}")
 
     meters = Meters()
+    stalled = None
     t_wall = time.perf_counter()
     try:
         run_stream(session, src, realtime, meters=meters, capture=capture,
                    quiet=('--file' in args and '--verbose' not in args))
     except KeyboardInterrupt:
         print("\nstopped.")
+    except AudioStalled as e:
+        # Not an error to swallow. Exiting with a non-zero status is the whole
+        # recovery mechanism: the supervisor in service.py reopens us against
+        # whatever device exists now. Staying alive would hold the lock and
+        # capture nothing.
+        stalled = e
+        print(f"\nAUDIO STALLED: {e}", file=sys.stderr, flush=True)
     wall = time.perf_counter() - t_wall
 
     print()
     print(f"frames into the gate: {meters.frames}"
           + (f"   device blocks: {capture.blocks}, samples {capture.samples}, "
-             f"peak {capture.peak:.4f}, dropped {capture.dropped}"
+             f"peak {capture.peak:.4f}, dropped {capture.dropped}, "
+             f"clock drift {capture.drift:+.3f}s at "
+             f"{100*capture.drift_rate:+.1f}% (worst offset "
+             f"{capture.drift_max:+.3f}s)"
+             + (", RATE OVER THE LIMIT" if abs(capture.drift_rate)
+                > CLOCK_DRIFT_RATE_WARN else "")
              if capture else ""))
     if capture and capture.status:
         print(f"PortAudio status flags: {capture.status}")
@@ -962,14 +1366,24 @@ def main():
         print(f"voice detector: highest probability {meters.vad_max:.3f}, "
               f"{meters.vad_over} frame(s) at or over {VAD_THRESHOLD}")
         print(f"segments: {meters.opens} opened, {meters.closes} closed, "
-              f"{meters.too_short} discarded as too short, "
-              f"{meters.segments_with_words} produced words, "
-              f"{meters.segments_no_words} produced none")
+              + (f"{meters.segments_dropped} DROPPED by a busy pipeline, "
+                 if meters.segments_dropped else "")
+              + f"{meters.too_short} discarded as too short, "
+              + f"{meters.segments_with_words} produced words, "
+              + f"{meters.segments_no_words} produced none")
+        # the suppression count, said out loud rather than only published to
+        # the viewer. It was computed all along and reached one consumer, so a
+        # run's own summary could not answer whether self-hearing had been
+        # caught -- which is the only question the fix exists to answer.
+        print(f"its own voice: {session.self_heard} utterance(s) recognised and "
+              f"not stored"
+              + (f", {session.clock_untrusted} undecidable under clock drift"
+                 if session.clock_untrusted else ""))
 
     problem = meters.diagnose(capture)
     if problem:
         print(f"\nNOTHING WAS PRODUCED, and this is why: {problem}")
-        return
+        return EXIT_STALLED if stalled else None
 
     T = session.timings
     print(f"\n{session.n_segments} segment(s), {session.n_words} word(s) over "
@@ -991,6 +1405,7 @@ def main():
     print(f"  processing per second of speech: {tot.sum()/a.sum():.3f}x "
           f"({100*tot.sum()/a.sum():.1f}% of one core while talking)")
     print(f"  records appended to {RECORDS_PATH.name}")
+    return EXIT_STALLED if stalled else None
 
 
 if __name__ == "__main__":
